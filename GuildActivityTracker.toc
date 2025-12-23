@@ -1,4 +1,4 @@
-## Interface: 100207
+## Interface: 110007
 ## Title: Guild Activity Tracker
 ## Notes: Professional guild chat activity analytics
 ## Author: Javier (Nexonir)
