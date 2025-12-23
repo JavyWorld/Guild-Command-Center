@@ -170,7 +170,7 @@ end
 -- =========================================================
 
 function GAT:ScanRosterForRanks()
-    if not IsInGuild() then return end
+    if not GAT.IsInGuild or not GAT:IsInGuild() then return end
     GAT.db = GAT.db or {}
     GAT.db.data = GAT.db.data or {}
 
