@@ -3,6 +3,7 @@ local GAT = _G[addonName] or {}
 _G[addonName] = GAT
 
 GAT.version = "4.0"
+local TARGET_GUILD_NAME = "Nexonir"
 
 function GAT:Print(msg)
     print("|cff00ff00[GAT]|r " .. msg)
@@ -24,7 +25,8 @@ local function UpdatePlayerAndGuild()
 end
 
 function GAT:IsInGuild()
-    return GAT.guildName == "Nexonir"
+    local current = (GAT.guildName or ""):lower()
+    return current ~= "" and current == TARGET_GUILD_NAME:lower()
 end
 
 f:SetScript("OnEvent", function(_, event, arg1)

@@ -47,7 +47,7 @@ function GAT:ScheduleNextSnapshot()
 end
 
 function GAT:TakeActivitySnapshot(force, immediate)
-    if not IsInGuild() then return end
+    if not GAT.IsInGuild or not GAT:IsInGuild() then return end
 
     local now = time()
     if not force and (now - GAT.LastSnapshotTime < MIN_SNAPSHOT_DELAY) then return end
