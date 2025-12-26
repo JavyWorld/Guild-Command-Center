@@ -2,985 +2,626 @@ local addonName = ...
 local GAT = _G[addonName]
 if not GAT then return end
 
--- ============================================================
---  GAT Sync (Multi-client, single-uploader, anti-duplication)
---  Objetivo:
---   - Cuando el MASTER (tu cuenta / tu PC) está online: SOLO el master cuenta chat/snapshots.
---   - Cuando el master está offline: se elige 1 LEADER automáticamente (determinístico).
---     Solo el leader cuenta y acumula deltas.
---   - Cuando el master vuelve: el leader (o su BACKUP) le envía los deltas al master.
---  Nota:
---   - No cambia el formato final de GuildActivityTrackerDB. Solo agrega GuildActivityTrackerDB._sync.
--- ============================================================
+-- =============================================================================
+-- Constantes
+-- =============================================================================
+local PREFIX = GAT.ADDON_PREFIX or "GATSYNC"
+local HEARTBEAT_INTERVAL = 5
+local ROLE_TICK_INTERVAL = 3
+local MASTER_TIMEOUT = 20
+local FLUSH_INTERVAL = 8
+local SEND_INTERVAL = 2
+local MAX_FRAGMENT = 220
+local SNAPSHOT_STATS_WINDOW = 7 * 24 * 3600
 
-local PREFIX = "GAT_SYNC_V1"
-local HB_INTERVAL = 5          -- heartbeat cada N segundos
-local PRESENCE_TTL = 18        -- si no hay HB en N s, ese peer se considera offline
-local MASTER_TTL = 18
-local FLUSH_INTERVAL = 10      -- crear delta batch cada N segundos (leader)
-local SEND_INTERVAL = 2        -- intentar enviar 1 batch cada N segundos (cuando master está online)
-local MAX_PAYLOAD = 220        -- objetivo para no pasar el límite de mensaje (seguro)
-local VERSION = 1
+local COLOR_GREEN = "22C55E"
+local COLOR_RED = "EF4444"
+local COLOR_YELLOW = "FACC15"
+local COLOR_BLUE = "3B82F6"
+local COLOR_WHITE = "FFFFFF"
 
-local function now() return GetTime() end
+local R = {
+    initialized = false,
+    role = "idle",
+    peers = {},
+    incoming = {},
+}
 
-local function safe_tostring(x)
-    if x == nil then return "" end
-    return tostring(x)
-end
-
-local function splitTabs(s)
-    local t = {}
-    local start = 1
-    while true do
-        local p = string.find(s, "\t", start, true)
-        if not p then
-            t[#t+1] = string.sub(s, start)
-            break
-        end
-        t[#t+1] = string.sub(s, start, p-1)
-        start = p + 1
-    end
-    return t
-end
-
-local function joinTabs(...)
-    return table.concat({...}, "\t")
-end
-
-
-local function fnv1a32(str)
-    local bxor = (bit and bit.bxor) or (bit32 and bit32.bxor)
-    if not bxor then
-        return "00000000"
-    end
-    local h = 2166136261
-    for i = 1, #str do
-        h = bxor(h, str:byte(i))
-        h = (h * 16777619) % 4294967296
-    end
-    return string.format("%08x", h)
-end
-
-local function genClientId()
-    -- ID estable por instalación (no perfecto, pero consistente y corto)
-    local seed = tostring(UnitGUID("player") or "") .. "|" .. tostring(GetRealmName() or "?") .. "|" .. tostring(time())
-    local a = fnv1a32(seed)
-    local b = fnv1a32(seed .. "|x")
-    return string.sub(a .. b, 1, 12)
-end
-
-local function isGuildReady()
-    -- Amarra el Sync al mismo filtro de hermandad del addon (Nexonir)
-    if GAT and GAT.IsInGuild then
-        return GAT:IsInGuild()
-    end
-    return IsInGuild and IsInGuild()
-end
-
-local function sendGuild(msg)
-    if not isGuildReady() then return false end
-    C_ChatInfo.SendAddonMessage(PREFIX, msg, "GUILD")
-    return true
-end
-
-local function sendWhisper(target, msg)
-    if not target or target == "" then return false end
-    C_ChatInfo.SendAddonMessage(PREFIX, msg, "WHISPER", target)
-    return true
-end
-
-local function isRecent(ts, ttl)
-    return (ts ~= nil) and ((now() - ts) <= ttl)
-end
-
-local function ensureTable(root, key)
-    if not root[key] then root[key] = {} end
-    return root[key]
-end
-
--- State (runtime)
-GAT.sync = GAT.sync or {}
-local S = GAT.sync
-
--- Persistent state inside DB
+-- =============================================================================
+-- Helpers de DB/estado
+-- =============================================================================
 local function ensureSyncDB()
-    GAT.db = GAT.db or {}
-    local sd = ensureTable(GAT.db, "_sync")
-    sd.clientId = sd.clientId or genClientId()
-    sd.rev = sd.rev or 0
-    sd.bcastSeq = sd.bcastSeq or 1
-    sd.applied = sd.applied or {}           -- applied[originId][seq]=true
-    sd.outbox = sd.outbox or { nextSeq = 1, pending = {} } -- pending[seq]=delta
-    sd.replica = sd.replica or {}           -- replica[originId][seq]=delta (backup)
-    return sd
+    return GAT:EnsureSyncDB()
 end
 
-
--- ============================================================
---  Mensajes (no-spam) + colores
--- ============================================================
-local C_WHITE  = "FFFFFF"
-local C_GRAY   = "9CA3AF"
-local C_GREEN  = "22C55E"
-local C_RED    = "EF4444"
-local C_YELLOW = "FACC15"
-local C_BLUE   = "3B82F6"
-
-local function hex(h)
-    h = tostring(h or "FFFFFF"):gsub("#","")
-    if #h == 8 then h = h:sub(3) end -- AARRGGBB -> RRGGBB
-    return h
+local function isInGuildScope()
+    return GAT:IsInTargetGuild()
 end
 
-local function color(h, txt)
-    return "|cff" .. hex(h) .. tostring(txt) .. "|r"
+local function now()
+    return GAT:Now()
 end
 
-local function syncPrint(key, msg)
+local function hasValues(tbl)
+    if not tbl then return false end
+    for _ in pairs(tbl) do return true end
+    return false
+end
+
+-- =============================================================================
+-- Mensajería anti-spam
+-- =============================================================================
+function GAT:SysMsg(key, text, colorHex, sessionScoped)
     local sd = ensureSyncDB()
-    sd._print = sd._print or {}
-    if sd._print[key] == msg then return end
-    sd._print[key] = msg
-    if GAT and GAT.Print then
-        GAT:Print(msg)
-    else
-        print(msg)
+    local cacheKey = sessionScoped and "_sessionPrint" or "printCache"
+    sd[cacheKey] = sd[cacheKey] or {}
+    local cache = sd[cacheKey]
+    if cache[key] == text then return end
+    cache[key] = text
+    if colorHex then
+        text = self:Color(colorHex, text)
     end
+    self:Print(text)
 end
 
-
--- Llamado opcional desde core.lua (si existe). No es obligatorio; el resto se inicializa en PLAYER_ENTERING_WORLD.
-function GAT:InitSync()
-    local _ = ensureSyncDB()
-    S.clientId = GAT.db._sync.clientId
-    S.peers = S.peers or {}
-end
-
-
-local function computeMasterAndLeader()
-    -- Determina masterOnline y leaderId en base a heartbeats recientes
-    local masterId, masterName
-    local selfMaster = (S.isMasterAccount == true) and isGuildReady()
-    if selfMaster then
-        masterId = S.clientId
-        masterName = S.selfName
-    end
-    local leaderId, backupId
-    local bestMasterId = masterId
-    local bestLeaderId = nil
-    local candidates = {}
-
-    for cid, peer in pairs(S.peers or {}) do
-        if isRecent(peer.lastHB, PRESENCE_TTL) then
-            candidates[#candidates+1] = cid
-            if peer.isMaster then
-                if (not bestMasterId) or (cid < bestMasterId) then
-                    bestMasterId = cid
-                    masterId = cid
-                    masterName = peer.sender
-                end
-            end
-        end
-    end
-
-    -- incluye self como candidato siempre (si está en guild)
-    if S.clientId and isGuildReady() then
-        candidates[#candidates+1] = S.clientId
-    end
-
-    local masterOnline = (masterId ~= nil)
-
-    if not masterOnline then
-        -- Leader = menor clientId entre NO-master online (incluye self)
-        for _, cid in ipairs(candidates) do
-            local p = S.peers[cid]
-            local isMasterPeer = (p and p.isMaster) or false
-            if cid == S.clientId and S.isMasterAccount then
-                isMasterPeer = true
-            end
-
-            if not isMasterPeer then
-                if (not bestLeaderId) or (cid < bestLeaderId) then
-                    bestLeaderId = cid
-                end
-            end
-        end
-        leaderId = bestLeaderId
-
-        -- Backup = segundo menor clientId entre NO-master (excluye leader)
-        local bestBackup
-        for _, cid in ipairs(candidates) do
-            if cid ~= leaderId then
-                local p = S.peers[cid]
-                local isMasterPeer = (p and p.isMaster) or false
-                if cid == S.clientId and S.isMasterAccount then
-                    isMasterPeer = true
-                end
-                if not isMasterPeer then
-                    if (not bestBackup) or (cid < bestBackup) then
-                        bestBackup = cid
-                    end
-                end
-            end
-        end
-        backupId = bestBackup
-    end
-
-    return masterOnline, masterId, masterName, leaderId, backupId
-end
-
-local function updateRole()
-    local masterOnline, masterId, masterName, leaderId, backupId = computeMasterAndLeader()
-
-    S.masterOnline = masterOnline
-    S.masterId = masterId
-    S.masterName = masterName
-    S.leaderId = leaderId
-    S.backupId = backupId
-
-    local prevRole = S.role
-    if masterOnline then
-        S.role = (S.isMasterAccount and "master") or "follower"
-    else
-        S.role = (S.clientId == leaderId and "leader") or "follower"
-    end
-
-    if prevRole ~= S.role then
-        local msg
-        if S.isMasterAccount then
-            msg = color(C_BLUE, "GM") .. " " .. color(C_GRAY, "(Master)") .. ": " ..
-                  color(C_GREEN, "recopilando") .. " + " .. color(C_BLUE, "sincronizando") .. "."
-        elseif masterOnline then
-            msg = color(C_GRAY, "Ayudante") .. ": " .. color(C_BLUE, "GM online") ..
-                  " • " .. color(C_YELLOW, "observando") .. " (no recopila)."
-        else
-            if S.role == "leader" then
-                msg = color(C_GREEN, "Ayudante") .. ": " .. color(C_RED, "GM offline") ..
-                      " • " .. color(C_GREEN, "recopilando") .. " (se enviará al GM al volver)."
-            elseif S.role == "backup" then
-                msg = color(C_YELLOW, "Ayudante") .. ": " .. color(C_RED, "GM offline") ..
-                      " • " .. color(C_YELLOW, "backup") .. " (guardando réplicas)."
-            else
-                msg = color(C_YELLOW, "Ayudante") .. ": " .. color(C_RED, "GM offline") ..
-                      " • " .. color(C_YELLOW, "idle") .. " (otro ayudante recopila)."
-            end
-        end
-        syncPrint("sync_role", msg)
-    end
-end
-
-
-
--- ============================================================
---  Master: mostrar estado de Ayudantes (sin spam)
--- ============================================================
-local function updateHelpersOnlineStatus()
-    if not S.isMasterAccount then return end
-    local nowt = now()
-    local names = {}
-    for n, p in pairs(S.peers) do
-        if p and p.last and (nowt - p.last) <= HB_TIMEOUT and (not p.isMaster) then
-            names[#names+1] = n
-        end
-    end
-    table.sort(names)
-    local count = #names
-
+local function resetSessionCache()
     local sd = ensureSyncDB()
-    local prev = sd._helpersCount
-    local numColor = C_WHITE
-    if prev == nil then
-        numColor = C_WHITE
-    elseif count > prev then
-        numColor = C_GREEN
-    elseif count < prev then
-        numColor = C_RED
-    end
-    sd._helpersCount = count
-
-    local msg = "Ayudantes online: " .. color(numColor, tostring(count))
-    if count > 0 then
-        msg = msg .. " " .. color(C_GRAY, "(" .. table.concat(names, ", ") .. ")")
-    end
-    syncPrint("helpers_online", msg)
+    sd._sessionPrint = {}
+    sd.sessionNonce = now()
 end
 
--- =============== Delta encoding =================
-
+-- =============================================================================
+-- Serialización simple (payloads pequeños + chunking)
+-- =============================================================================
 local function encodeDaily(daily)
     if not daily then return "" end
     local parts = {}
     for day, cnt in pairs(daily) do
-        parts[#parts+1] = day .. ":" .. tostring(cnt)
+        parts[#parts + 1] = day .. ":" .. tostring(cnt)
     end
     table.sort(parts)
     return table.concat(parts, "|")
 end
 
 local function decodeDaily(s)
-    local t = {}
-    if not s or s == "" then return t end
-    for token in string.gmatch(s, "([^|]+)") do
-        local day, cnt = string.match(token, "^(%d%d%d%d%-%d%d%-%d%d):(%d+)$")
-        if day and cnt then
-            t[day] = tonumber(cnt) or 0
-        end
+    local out = {}
+    if not s or s == "" then return out end
+    for token in s:gmatch("([^|]+)") do
+        local d, c = token:match("^(%d%d%d%d%-%d%d%-%d%d):(%d+)$")
+        if d and c then out[d] = tonumber(c) or 0 end
     end
-    return t
+    return out
 end
 
-local function buildDeltaPayload(delta)
-    -- convierte delta a lista de items "name,inc,lastTS,daily"
-    local items = {}
-
-    if delta.activity then
-        for name, d in pairs(delta.activity) do
-            local inc = d.incTotal or 0
-            local lastTS = d.lastSeenTS or 0
-            local daily = encodeDaily(d.daily)
-            local item = table.concat({name, tostring(inc), tostring(lastTS), daily}, ",")
-            items[#items+1] = item
-        end
-    end
-
-    if delta.snapshots then
-        for ts, onlineCount in pairs(delta.snapshots) do
-            local item = "@" .. tostring(ts) .. "," .. tostring(onlineCount)
-            items[#items+1] = item
-        end
-    end
-
-    table.sort(items)
-    return items
-end
-
-local function sendDeltaParts(msgType, target, originId, seq, items)
-    -- chunk por tamaño
+local function encodeDelta(delta)
     local parts = {}
-    local cur = ""
-    local function pushCur()
-        if cur ~= "" then
-            parts[#parts+1] = cur
-            cur = ""
-        end
-    end
-
-    for _, item in ipairs(items) do
-        local add = (cur == "") and item or (cur .. ";" .. item)
-        local header = joinTabs(msgType, originId, tostring(seq), "1", "1", "") -- placeholder
-        local estimate = #header + #add
-        if estimate > MAX_PAYLOAD then
-            pushCur()
-            cur = item
-        else
-            cur = add
-        end
-    end
-    pushCur()
-    local total = #parts
-    for i=1,total do
-        local msg = joinTabs(msgType, originId, tostring(seq), tostring(i), tostring(total), parts[i])
-        sendWhisper(target, msg)
-    end
-end
-
-
-local function sendDeltaPartsGuild(msgType, originId, seq, items)
-    -- Igual que sendDeltaParts, pero a canal GUILD (para sincronizar UI de todos)
-    local parts = {}
-    local cur = ""
-    local function pushCur()
-        if cur ~= "" then
-            parts[#parts+1] = cur
-            cur = ""
-        end
-    end
-
-    for _, item in ipairs(items) do
-        local add = (cur == "") and item or (cur .. ";" .. item)
-        local header = joinTabs(msgType, originId, tostring(seq), "1", "1", "") -- placeholder
-        local estimate = #header + #add
-        if estimate > MAX_PAYLOAD then
-            pushCur()
-            cur = item
-        else
-            cur = add
-        end
-    end
-    pushCur()
-    local total = #parts
-    for i=1,total do
-        local msg = joinTabs(msgType, originId, tostring(seq), tostring(i), tostring(total), parts[i])
-        sendGuild(msg)
-    end
-end
-
-
-local function applyDeltaToDB(delta)
-    if not GAT.db or not GAT.db.data then return end
-
     if delta.activity then
-        for name, d in pairs(delta.activity) do
-            local entry = GAT.db.data[name]
-            if not entry then
-                entry = { total = 0, lastSeen = "", lastMessage = "", daily = {}, rankIndex = 99, rankName = "—" }
-                GAT.db.data[name] = entry
-            end
-
-            local inc = tonumber(d.incTotal or 0) or 0
-            entry.total = (tonumber(entry.total) or 0) + inc
-
-            local lastTS = tonumber(d.lastSeenTS or 0) or 0
-            if lastTS > 0 then
-                -- Mantén el formato del addon (texto) sin romper nada
-                local newLastSeen = date("%Y-%m-%d %I:%M %p", lastTS)
-                if entry.lastSeen == "" or (entry._lastSeenTS and lastTS > entry._lastSeenTS) then
-                    entry.lastSeen = newLastSeen
-                    entry._lastSeenTS = lastTS -- campo interno, inocuo para uploader
-                end
-            end
-
-            entry.daily = entry.daily or {}
-            if d.daily then
-                for day, cnt in pairs(d.daily) do
-                    entry.daily[day] = (tonumber(entry.daily[day]) or 0) + (tonumber(cnt) or 0)
-                end
-            end
+        for name, data in pairs(delta.activity) do
+            local seg = table.concat({
+                "A",
+                name,
+                tostring(data.inc or 0),
+                tostring(data.lastSeenTS or 0),
+                encodeDaily(data.daily)
+            }, ",")
+            parts[#parts + 1] = seg
         end
     end
-
-    if delta.snapshots then
-        GAT.db.stats = GAT.db.stats or {}
-        for ts, onlineCount in pairs(delta.snapshots) do
-            if not GAT.db.stats[ts] then
-                GAT.db.stats[ts] = onlineCount
-            end
+    if delta.stats then
+        for ts, cnt in pairs(delta.stats) do
+            parts[#parts + 1] = table.concat({ "S", tostring(ts), tostring(cnt) }, ",")
         end
     end
-
-    -- rev para debug y para futuro state sync
-    local sd = ensureSyncDB()
-    sd.rev = (sd.rev or 0) + 1
+    table.sort(parts)
+    return table.concat(parts, ";")
 end
 
-
-local function applyDeleteToDB(name)
-    if not name or name == "" then return end
-    if not GAT.db or not GAT.db.data then return end
-
-    -- No re-broadcast aquí: el que borra es el master
-    if GAT.db.data[name] then
-        GAT.db.data[name] = nil
-        local sd = ensureSyncDB()
-        sd.rev = (sd.rev or 0) + 1
-        if GAT.RefreshUI then GAT:RefreshUI() end
-    end
-end
-
-local function broadcastDelete(name)
-    if not name or name == "" then return end
-    -- Solo el master build puede emitir deletes
-    if not (S and S.isMasterAccount) then return end
-    sendGuild(joinTabs("X", name))
-end
-
-function GAT:Sync_BroadcastDelete(name)
-    broadcastDelete(name)
-end
-
-local function broadcastDeltaToGuild(delta)
-    if not delta then return end
-    local sd = ensureSyncDB()
-    local seq = sd.bcastSeq or 1
-    sd.bcastSeq = seq + 1
-    local items = buildDeltaPayload(delta)
-    sendDeltaPartsGuild("U", S.clientId, seq, items)
-end
-
-
--- Receiver assembly
-S.incoming = S.incoming or {} -- incoming[originId][seq] = {total=, parts=, got={}, items={}}
-
-local function onDeltaPart(sender, msgType, originId, seq, part, total, payload)
-    S.incoming[originId] = S.incoming[originId] or {}
-    local bucket = S.incoming[originId][seq]
-    if not bucket then
-        bucket = { total = total, got = {}, payloads = {} }
-        S.incoming[originId][seq] = bucket
-        -- Master: aviso de recepción (1 por batch)
-        if (msgType ~= "U") and S.isMasterAccount then
-            S._rx = S._rx or {}
-            local k = originId .. ":" .. tostring(seq)
-            if not S._rx[k] then
-                S._rx[k] = now()
-                syncPrint("rx_state",
-                    color(C_BLUE, "Recibiendo sync") .. " de " .. color(C_GRAY, sender) ..
-                    " • " .. color(C_YELLOW, "NO uses /reload") .. ".")
-            end
-        end
-    end
-    bucket.total = total
-    bucket.got[part] = true
-    bucket.payloads[part] = payload or ""
-
-    -- complete?
-    for i=1,total do
-        if not bucket.got[i] then return end
-    end
-
-    -- build items list
-    local all = table.concat(bucket.payloads, ";")
-    local delta = { activity = {}, snapshots = {} }
-
-    for token in string.gmatch(all, "([^;]+)") do
-        if string.sub(token, 1, 1) == "@" then
-            local ts, online = string.match(token, "^@(%d+),(%d+)$")
-            if ts and online then
-                delta.snapshots[tonumber(ts)] = tonumber(online)
-            end
-        else
-            local name, inc, lastTS, daily = string.match(token, "^([^,]+),([^,]*),([^,]*),(.*)$")
+local function decodeDelta(payload)
+    local delta = { activity = {}, stats = {} }
+    if not payload or payload == "" then return delta end
+    for token in payload:gmatch("([^;]+)") do
+        local tag = token:sub(1, 1)
+        if tag == "A" then
+            local _, name, inc, ts, daily = token:match("^(A),([^,]+),([^,]*),([^,]*),(.*)$")
             if name then
-                local d = { incTotal = tonumber(inc) or 0, lastSeenTS = tonumber(lastTS) or 0, daily = decodeDaily(daily) }
-                delta.activity[name] = d
+                delta.activity[name] = {
+                    inc = tonumber(inc) or 0,
+                    lastSeenTS = tonumber(ts) or 0,
+                    daily = decodeDaily(daily)
+                }
             end
+        elseif tag == "S" then
+            local _, ts, cnt = token:match("^(S),([^,]+),([^,]+)$")
+            if ts then delta.stats[tonumber(ts) or 0] = tonumber(cnt) or 0 end
+        end
+    end
+    return delta
+end
+
+local function encodeSnapshot()
+    local db = GAT.db or {}
+    local parts = {}
+    for name, entry in pairs(db.data or {}) do
+        if type(entry) == "table" then
+            parts[#parts + 1] = table.concat({
+                "F",
+                name,
+                tostring(entry.total or 0),
+                tostring(entry.lastSeenTS or 0),
+                tostring(entry.rankIndex or ""),
+                tostring(entry.rankName or ""),
+                encodeDaily(entry.daily or {})
+            }, ",")
         end
     end
 
-    -- cleanup assembly bucket
-    S.incoming[originId][seq] = nil
+    local cutoff = now() - SNAPSHOT_STATS_WINDOW
+    for ts, cnt in pairs(db.stats or {}) do
+        if ts >= cutoff then
+            parts[#parts + 1] = table.concat({ "S", tostring(ts), tostring(cnt) }, ",")
+        end
+    end
+    table.sort(parts)
+    return table.concat(parts, ";")
+end
 
-    -- If this is REPLICA (backup store) just save; if DELTA and I'm master => apply
+local function decodeSnapshot(payload)
+    local snap = { activity = {}, stats = {} }
+    if not payload or payload == "" then return snap end
+    for token in payload:gmatch("([^;]+)") do
+        local tag = token:sub(1, 1)
+        if tag == "F" then
+            local _, name, total, ts, rankIdx, rankName, daily = token:match("^(F),([^,]+),([^,]*),([^,]*),([^,]*),([^,]*),(.*)$")
+            if name then
+                snap.activity[name] = {
+                    total = tonumber(total) or 0,
+                    lastSeenTS = tonumber(ts) or 0,
+                    rankIndex = tonumber(rankIdx),
+                    rankName = rankName ~= "" and rankName or nil,
+                    daily = decodeDaily(daily)
+                }
+            end
+        elseif tag == "S" then
+            local _, ts, cnt = token:match("^(S),([^,]+),([^,]+)$")
+            if ts then snap.stats[tonumber(ts) or 0] = tonumber(cnt) or 0 end
+        end
+    end
+    return snap
+end
+
+local function sendAddonMessage(channel, target, msg)
+    if not isInGuildScope() then return end
+    C_ChatInfo.SendAddonMessage(PREFIX, msg, channel, target)
+end
+
+local function chunkAndSend(msgType, session, fromId, seq, payload, channel, target)
+    local totalParts = math.max(1, math.ceil(#payload / MAX_FRAGMENT))
+    for idx = 1, totalParts do
+        local startIdx = (idx - 1) * MAX_FRAGMENT + 1
+        local partPayload = payload:sub(startIdx, startIdx + MAX_FRAGMENT - 1)
+        local msg = string.format("T=%s|sid=%s|from=%s|seq=%s|part=%d/%d|data=%s", msgType, session, fromId, seq, idx, totalParts, partPayload)
+        sendAddonMessage(channel, target, msg)
+    end
+end
+
+-- =============================================================================
+-- Roles y presencia
+-- =============================================================================
+local function markPeer(sender, payload)
     local sd = ensureSyncDB()
+    sd.peers = sd.peers or {}
+    local peer = sd.peers[payload.from] or {}
+    peer.name = payload.name or sender
+    peer.isMaster = payload.master == "1"
+    peer.lastSeen = now()
+    sd.peers[payload.from] = peer
+end
 
-    if msgType == "R" then
-        sd.replica[originId] = sd.replica[originId] or {}
-        sd.replica[originId][seq] = delta
-        -- ACK replica al sender
-        sendWhisper(sender, joinTabs("AR", originId, tostring(seq)))
+local function computeRole()
+    local sd = ensureSyncDB()
+    local masterOnline = GAT:IsMasterBuild()
+    local masterPeerId
+    local nowt = now()
+    for cid, peer in pairs(sd.peers or {}) do
+        if peer.isMaster and (nowt - (peer.lastSeen or 0) < MASTER_TIMEOUT) then
+            masterOnline = true
+            masterPeerId = cid
+            break
+        end
+    end
+
+    local collectorId
+    if not masterOnline then
+        local candidates = {}
+        candidates[#candidates + 1] = sd.clientId
+        for cid, peer in pairs(sd.peers or {}) do
+            if nowt - (peer.lastSeen or 0) < MASTER_TIMEOUT then
+                candidates[#candidates + 1] = cid
+            end
+        end
+        table.sort(candidates)
+        collectorId = candidates[1]
+    end
+
+    local prevRole = R.role
+    R.masterOnline = masterOnline
+    R.masterPeerId = masterPeerId
+    R.role = (masterOnline and GAT:IsMasterBuild()) and "master"
+        or (not masterOnline and sd.clientId == collectorId) and "collector"
+        or "idle"
+
+    if prevRole ~= R.role then
+        if R.role == "master" then
+            GAT:SysMsg("role_state", "GM online: recopilando y sincronizando.", COLOR_BLUE, true)
+        elseif R.role == "collector" then
+            GAT:SysMsg("role_state", "Ayudante: GM offline • recopilando datos.", COLOR_GREEN, true)
+        elseif masterOnline then
+            GAT:SysMsg("role_state", "Ayudante: GM online • idle.", COLOR_YELLOW, true)
+        else
+            GAT:SysMsg("role_state", "Ayudante: GM offline • otro recopila.", COLOR_YELLOW, true)
+        end
+    end
+end
+
+-- =============================================================================
+-- Deltas y backlog
+-- =============================================================================
+function GAT:Sync_RecordDelta_Activity(name, inc, lastSeenTS, dailyKey)
+    if not isInGuildScope() then return end
+    local sd = ensureSyncDB()
+    sd.pending = sd.pending or { activity = {}, stats = {} }
+    local a = sd.pending.activity[name] or { inc = 0, lastSeenTS = 0, daily = {} }
+    a.inc = (a.inc or 0) + (inc or 0)
+    a.lastSeenTS = math.max(a.lastSeenTS or 0, lastSeenTS or 0)
+    if dailyKey then
+        a.daily[dailyKey] = (a.daily[dailyKey] or 0) + (inc or 0)
+    end
+    sd.pending.activity[name] = a
+end
+
+function GAT:Sync_RecordDelta_Stats(ts, onlineCount)
+    if not isInGuildScope() then return end
+    local sd = ensureSyncDB()
+    sd.pending = sd.pending or { activity = {}, stats = {} }
+    sd.pending.stats = sd.pending.stats or {}
+    sd.pending.stats[ts] = onlineCount
+end
+
+local function queueBacklog(delta)
+    local sd = ensureSyncDB()
+    sd.pendingSeq = sd.pendingSeq or 1
+    local seq = sd.pendingSeq
+    sd.pendingSeq = seq + 1
+    sd.pendingBacklog[seq] = delta
+end
+
+local function flushPending()
+    if not isInGuildScope() then return end
+    local sd = ensureSyncDB()
+    sd.pending = sd.pending or { activity = {}, stats = {} }
+    sd.pendingSeq = sd.pendingSeq or 1
+
+    local hasPending = hasValues(sd.pending.activity) or hasValues(sd.pending.stats)
+    if not hasPending then return end
+
+    if R.role == "collector" and not R.masterOnline then
+        queueBacklog(sd.pending)
+        sd.pending = { activity = {}, stats = {} }
+    elseif R.role == "master" then
+        local payload = encodeDelta(sd.pending)
+        chunkAndSend("U", sd.sessionNonce or now(), sd.clientId, sd.pendingSeq or 0, payload, "GUILD")
+        sd.pendingSeq = sd.pendingSeq + 1
+        sd.pending = { activity = {}, stats = {} }
+    end
+end
+
+local function applyDelta(delta)
+    if not delta then return end
+    for name, data in pairs(delta.activity or {}) do
+        GAT:MergeEntry(name, {
+            total = data.inc or 0,
+            lastSeenTS = data.lastSeenTS,
+            daily = data.daily
+        }, "delta")
+    end
+    if delta.stats and GAT.db then
+        GAT.db.stats = GAT.db.stats or {}
+        for ts, cnt in pairs(delta.stats) do
+            if not GAT.db.stats[ts] then
+                GAT.db.stats[ts] = cnt
+            end
+        end
+    end
+end
+
+-- =============================================================================
+-- Envío / recepción de backlog
+-- =============================================================================
+local function markAck(originId, seq)
+    local sd = ensureSyncDB()
+    sd.pendingBacklog[seq] = nil
+end
+
+local function sendOneBacklog()
+    if not R.masterOnline or GAT:IsMasterBuild() then return end
+    local sd = ensureSyncDB()
+    local masterPeer = (sd.peers or {})[R.masterPeerId]
+    if not masterPeer or not masterPeer.name then return end
+    local seq
+    for s in pairs(sd.pendingBacklog or {}) do
+        seq = s
+        break
+    end
+    if not seq then return end
+    local payload = encodeDelta(sd.pendingBacklog[seq])
+    chunkAndSend("BACK", sd.sessionNonce or now(), sd.clientId, seq, payload, "WHISPER", masterPeer.name)
+    GAT:SysMsg("tx_state", "Sync en progreso: enviando backlog al GM.", COLOR_YELLOW, false)
+end
+
+-- =============================================================================
+-- Snapshots
+-- =============================================================================
+local function applySnapshot(snap)
+    if not snap then return end
+    for name, entry in pairs(snap.activity or {}) do
+        GAT:MergeEntry(name, entry, "snapshot")
+    end
+    if snap.stats and GAT.db then
+        GAT.db.stats = GAT.db.stats or {}
+        for ts, cnt in pairs(snap.stats) do
+            GAT.db.stats[ts] = cnt
+        end
+    end
+    if GAT.RefreshUI then GAT:RefreshUI() end
+end
+
+local function sendSnapshot(target)
+    local sd = ensureSyncDB()
+    sd.pendingSeq = sd.pendingSeq or 1
+    local payload = encodeSnapshot()
+    chunkAndSend("SNAP", sd.sessionNonce or now(), sd.clientId, sd.pendingSeq or 0, payload, "WHISPER", target)
+    sd.pendingSeq = sd.pendingSeq + 1
+end
+
+function GAT:Sync_Manual()
+    if not isInGuildScope() then
+        self:SysMsg("manual_sync_guild", "No estás en la guild objetivo.", COLOR_RED, true)
+        return
+    end
+    local sd = ensureSyncDB()
+    if self:IsMasterBuild() then
+        local any = false
+        for _, peer in pairs(sd.peers or {}) do
+            if peer.name and (now() - (peer.lastSeen or 0) < MASTER_TIMEOUT) and not peer.isMaster then
+                sendSnapshot(peer.name)
+                any = true
+            end
+        end
+        self:SysMsg("manual_sync_master", any and "Sync enviado a ayudantes online." or "No hay ayudantes online.", any and COLOR_GREEN or COLOR_YELLOW, false)
         return
     end
 
-    if msgType == "U" then
-        -- Broadcast de actualizaciones del Master/Líder hacia todos: NO ACK
-        local appliedU = sd.appliedU
-        if not appliedU then
-            appliedU = {}
-            sd.appliedU = appliedU
-        end
-        appliedU[originId] = appliedU[originId] or {}
-        if appliedU[originId][seq] then return end
-        appliedU[originId][seq] = true
+    if not R.masterOnline or not R.masterPeerId then
+        self:SysMsg("manual_sync_nomaster", "GM no está conectado.", COLOR_RED, true)
+        return
+    end
 
-        -- Evita auto-aplicar en caso de recibir tu propio broadcast (por si acaso)
-        if originId ~= S.clientId then
-            applyDeltaToDB(delta)
+    local masterPeer = (sd.peers or {})[R.masterPeerId]
+    if masterPeer and masterPeer.name then
+        local msg = string.format("T=REQSNAP|from=%s", sd.clientId)
+        sendAddonMessage("WHISPER", masterPeer.name, msg)
+        self:SysMsg("manual_sync_request", "Solicitando sync al GM...", COLOR_BLUE, false)
+    end
+end
+
+function GAT:Sync_GetHelpersForUI()
+    local sd = ensureSyncDB()
+    local list = {}
+    local nowt = now()
+    for cid, peer in pairs(sd.peers or {}) do
+        if not peer.isMaster then
+            table.insert(list, {
+                name = peer.name or cid,
+                count = 0,
+                lastSeen = peer.lastSeen and date("%Y-%m-%d %H:%M", peer.lastSeen) or "—",
+                lastSeenTS = peer.lastSeen or 0,
+                rankIndex = 99,
+                rankName = peer.isCollector and "Recolector" or "Ayudante"
+            })
+        end
+    end
+    table.sort(list, function(a, b) return (a.lastSeenTS or 0) > (b.lastSeenTS or 0) end)
+    return list
+end
+
+function GAT:Sync_BroadcastDelete(name)
+    if not self:IsMasterBuild() or not name then return end
+    local msg = string.format("T=DEL|name=%s", name)
+    sendAddonMessage("GUILD", nil, msg)
+end
+
+-- =============================================================================
+-- Roles públicos
+-- =============================================================================
+function GAT:Sync_ShouldCollectChat()
+    if not isInGuildScope() then return false end
+    if R.masterOnline then
+        return self:IsMasterBuild()
+    end
+    return R.role == "collector"
+end
+
+function GAT:Sync_ShouldCollectStats()
+    return self:Sync_ShouldCollectChat()
+end
+
+-- =============================================================================
+-- Mensajes entrantes
+-- =============================================================================
+local function parseLine(msg)
+    local out = {}
+    for chunk in msg:gmatch("[^|]+") do
+        local k, v = chunk:match("^(.-)=(.*)$")
+        if k then out[k] = v end
+    end
+    return out
+end
+
+local function handleComplete(payload, meta, sender)
+    local typ = meta.T
+    if typ == "U" then
+        local delta = decodeDelta(payload)
+        applyDelta(delta)
+        if GAT.RefreshUI then GAT:RefreshUI() end
+        return
+    end
+    if typ == "BACK" then
+        if not GAT:IsMasterBuild() then return end
+        local delta = decodeDelta(payload)
+        local sd = ensureSyncDB()
+        local lastSeq = (sd.lastAppliedSeqByPeer or {})[meta.from] or 0
+        local seqNum = tonumber(meta.seq) or 0
+        if seqNum > lastSeq then
+            applyDelta(delta)
+            sd.lastAppliedSeqByPeer[meta.from] = seqNum
+            chunkAndSend("ACK", sd.sessionNonce or now(), sd.clientId, seqNum, "", "WHISPER", sender)
+            GAT:SysMsg("rx_backlog", "Sync recibido de ayudante.", COLOR_GREEN, false)
+            sendSnapshot(sender)
+        else
+            chunkAndSend("ACK", sd.sessionNonce or now(), sd.clientId, seqNum, "", "WHISPER", sender)
+        end
+        return
+    end
+    if typ == "SNAP" then
+        local snap = decodeSnapshot(payload)
+        applySnapshot(snap)
+        GAT:SysMsg("snap_ok", "Sync aplicado.", COLOR_GREEN, false)
+        return
+    end
+end
+
+local function handleFragment(sender, attrs)
+    local partStr = attrs.part or "1/1"
+    local cur, total = partStr:match("^(%d+)%/(%d+)$")
+    cur, total = tonumber(cur) or 1, tonumber(total) or 1
+    local key = table.concat({ attrs.sid or "0", attrs.seq or "0", attrs.from or sender, attrs.T }, ":")
+    R.incoming[key] = R.incoming[key] or { total = total, parts = {}, meta = attrs, sender = sender }
+    local bucket = R.incoming[key]
+    bucket.total = total
+    bucket.parts[cur] = attrs.data or ""
+    local complete = true
+    for i = 1, bucket.total do
+        if not bucket.parts[i] then complete = false break end
+    end
+    if complete then
+        local payload = table.concat(bucket.parts, "")
+        R.incoming[key] = nil
+        handleComplete(payload, bucket.meta, sender)
+    end
+end
+
+local function onAddonMessage(prefix, message, channel, sender)
+    if prefix ~= PREFIX then return end
+    local attrs = parseLine(message)
+    if attrs.T == "HB" then
+        markPeer(sender, attrs)
+        computeRole()
+        return
+    end
+
+    if attrs.T == "DEL" then
+        if GAT.db and GAT.db.data then
+            GAT.db.data[attrs.name] = nil
             if GAT.RefreshUI then GAT:RefreshUI() end
         end
         return
     end
-    if msgType == "D" then
-        -- Solo el master aplica
-        if not S.isMasterAccount then
-            return
-        end
 
-        sd.applied[originId] = sd.applied[originId] or {}
-        if sd.applied[originId][seq] then
-            -- ya aplicado, igual ACK
-            sendWhisper(sender, joinTabs("A", originId, tostring(seq)))
-            return
-        end
-
-        applyDeltaToDB(delta)
-
-        -- Master re-broadcast a la hermandad para sincronizar UI de todos
-        if S.isMasterAccount then
-            broadcastDeltaToGuild(delta)
-            syncPrint("rx_state", color(C_GREEN, "Sync recibido") .. " de " .. color(C_GRAY, sender) .. ".")
-        end
-
-        sd.applied[originId][seq] = true
-
-        -- ACK al sender (leader o backup)
-        sendWhisper(sender, joinTabs("A", originId, tostring(seq)))
-
-        -- opcional: refrescar UI si está abierta
-        if GAT.RefreshUI then
-            GAT:RefreshUI()
-        end
-    end
-end
-
-local function markAcked(originId, seq)
-    local sd = ensureSyncDB()
-    if sd.outbox and sd.outbox.pending then
-        sd.outbox.pending[seq] = nil
-
-    -- ¿Quedan batches pendientes?
-    local remaining = 0
-    for _ in pairs(sd.outbox.pending) do remaining = remaining + 1 end
-    if remaining == 0 then
-        if S._tx then S._tx.active = false end
-        syncPrint("tx_state", color(C_GREEN, "Sync COMPLETADO") .. ": datos entregados al " .. color(C_BLUE, "GM") .. ".")
-        syncPrint("tx_warn", "")
-    end
-
-    -- ¿Quedan batches pendientes?
-    local remaining = 0
-    for _ in pairs(sd.outbox.pending) do remaining = remaining + 1 end
-    if remaining == 0 then
-        if S._tx then S._tx.active = false end
-        syncPrint("tx_state", color(C_GREEN, "Sync COMPLETADO") .. ": datos entregados al " .. color(C_BLUE, "GM") .. ".")
-        syncPrint("tx_warn", "") -- limpia warning si existía
-    end
-    end
-    -- también quita replicas si eres backup
-    if sd.replica and sd.replica[originId] then
-        sd.replica[originId][seq] = nil
-        if next(sd.replica[originId]) == nil then
-            sd.replica[originId] = nil
-        end
-    end
-end
-
--- ================== Public API used by other files ==================
-
-function GAT:ShouldCountChat()
-    -- Master online => solo master cuenta
-    if S.masterOnline then
-        return S.isMasterAccount
-    end
-    -- Master offline => solo leader cuenta
-    return (S.role == "leader")
-end
-
-function GAT:Sync_RecordChat(fullPlayerName, msg, lineId, guid)
-    -- Solo guardamos deltas si este cliente está contando (leader)
-    if not self:ShouldCountChat() then return end
-    local sd = ensureSyncDB()
-
-    S.pending = S.pending or { activity = {}, snapshots = {} }
-    local today = date("%Y-%m-%d")
-    local a = S.pending.activity[fullPlayerName]
-    if not a then
-        a = { incTotal = 0, lastSeenTS = 0, daily = {} }
-        S.pending.activity[fullPlayerName] = a
-    end
-    a.incTotal = (a.incTotal or 0) + 1
-    a.daily[today] = (a.daily[today] or 0) + 1
-    a.lastSeenTS = time()
-end
-
-function GAT:Sync_RecordSnapshot(ts, totalOnlineStats)
-    if not self:ShouldCountChat() then return end
-    S.pending = S.pending or { activity = {}, snapshots = {} }
-    S.pending.snapshots[ts] = totalOnlineStats
-end
-
--- ================== Flush & Send loop ==================
-
-local function makeDeltaFromPending()
-    if not S.pending then return nil end
-    local hasAny = false
-    local delta = { activity = {}, snapshots = {} }
-
-    for name, d in pairs(S.pending.activity or {}) do
-        delta.activity[name] = d
-        hasAny = true
-    end
-    for ts, val in pairs(S.pending.snapshots or {}) do
-        delta.snapshots[ts] = val
-        hasAny = true
-    end
-
-    if not hasAny then return nil end
-    -- reset pending
-    S.pending = { activity = {}, snapshots = {} }
-    return delta
-end
-
-local function enqueueOutbox(delta)
-                broadcastDeltaToGuild(delta)
-    local sd = ensureSyncDB()
-    local seq = sd.outbox.nextSeq or 1
-    sd.outbox.nextSeq = seq + 1
-    sd.outbox.pending[seq] = delta
-
-    S.sendQueue = S.sendQueue or {}
-    S.sendQueue[#S.sendQueue+1] = seq
-end
-
-local function getTargetMasterName()
-    if not S.masterOnline then return nil end
-    return S.masterName
-end
-
-local function trySendOneBatch()
-    if not S.masterOnline then return end
-    if S.isMasterAccount then return end -- master no se manda a sí mismo
-
-    local sd = ensureSyncDB()
-    S.sendQueue = S.sendQueue or {}
-
-    -- Si no hay queue, reconstruye a partir de pending en DB (por si reload)
-    if #S.sendQueue == 0 then
-        local seqs = {}
-        for seq, _ in pairs(sd.outbox.pending or {}) do
-            seqs[#seqs+1] = seq
-        end
-        table.sort(seqs)
-        for _, seq in ipairs(seqs) do
-            S.sendQueue[#S.sendQueue+1] = seq
-        end
-    end
-
-    local seq = S.sendQueue[1]
-    if not seq then return end
-
-    local delta = sd.outbox.pending[seq]
-    if not delta then
-        table.remove(S.sendQueue, 1)
-        return
-    end
-
-    -- UX: avisos (sin spam) mientras se envían batches al GM
-    S._tx = S._tx or {}
-    if not S._tx.active then
-        S._tx.active = true
-        S._tx.started = now()
-        S._tx.warned = false
-        syncPrint("tx_state",
-            color(C_YELLOW, "Sync INICIADO") .. ": enviando datos al " .. color(C_BLUE, "GM") ..
-            " • " .. color(C_YELLOW, "NO uses /reload") .. " hasta terminar.")
-    end
-    S._tx.lastSent = now()
-
-    local target = getTargetMasterName()
-    if not target then return end
-
-    local items = buildDeltaPayload(delta)
-    sendDeltaParts("D", target, S.clientId, seq, items)
-end
-
-local function replicateToBackupIfNeeded(seq, delta)
-    if S.masterOnline then return end
-    if S.role ~= "leader" then return end
-    if not S.backupId then return end
-
-    local backup = S.peers[S.backupId]
-    if not backup or not isRecent(backup.lastHB, PRESENCE_TTL) then return end
-
-    local items = buildDeltaPayload(delta)
-    sendDeltaParts("R", backup.sender, S.clientId, seq, items)
-end
-
-local function forwardReplicaIfLeaderMissing()
-    if not S.masterOnline then return end
-    if S.isMasterAccount then return end
-
-    -- Solo si NO hay leader online
-    if S.leaderId and S.peers[S.leaderId] and isRecent(S.peers[S.leaderId].lastHB, PRESENCE_TTL) then
-        return
-    end
-
-    local sd = ensureSyncDB()
-    if not sd.replica then return end
-    local target = getTargetMasterName()
-    if not target then return end
-
-    for originId, batches in pairs(sd.replica) do
-        local seqs = {}
-        for seq,_ in pairs(batches) do seqs[#seqs+1]=seq end
-        table.sort(seqs)
-        for _, seq in ipairs(seqs) do
-            local delta = batches[seq]
-            if delta then
-                local items = buildDeltaPayload(delta)
-                sendDeltaParts("D", target, originId, seq, items) -- nota: originId original
-            end
-        end
-    end
-end
-
--- ================== Event wiring ==================
-
-local frame = CreateFrame("Frame")
-frame:RegisterEvent("CHAT_MSG_ADDON")
-frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-frame:RegisterEvent("GUILD_ROSTER_UPDATE")
-
-frame:SetScript("OnEvent", function(_, event, ...)
-    if event == "CHAT_MSG_ADDON" then
-        local prefix, msg, channel, sender = ...
-        if prefix ~= PREFIX then return end
-        if not msg or msg == "" then return end
-
-        local parts = splitTabs(msg)
-        local typ = parts[1]
-
-        if typ == "HB" then
-            local cid = parts[2]
-            local ver = tonumber(parts[3]) or 0
-            local isMaster = (parts[4] == "1")
-            local rev = tonumber(parts[5]) or 0
-
-            if not cid or cid == "" then return end
-            S.peers = S.peers or {}
-            local p = S.peers[cid] or {}
-            p.sender = sender
-            p.ver = ver
-            p.isMaster = isMaster
-            p.rev = rev
-            p.lastHB = now()
-            S.peers[cid] = p
-
-            -- Recalcula role rápido cuando llega HB
-            updateRole()
-            return
-        end
-
-        if typ == "D" or typ == "R" or typ == "U" then
-            local originId = parts[2]
-            local seq = tonumber(parts[3]) or 0
-            local part = tonumber(parts[4]) or 1
-            local total = tonumber(parts[5]) or 1
-            local payload = parts[6] or ""
-            if originId and seq > 0 then
-                onDeltaPart(sender, typ, originId, seq, part, total, payload)
-            end
-            return
-        end
-
-        if typ == "A" then
-            local originId = parts[2]
-            local seq = tonumber(parts[3]) or 0
-            if originId and seq > 0 then
-                markAcked(originId, seq)
-            end
-            return
-        end
-
-        if typ == "AR" then
-            -- ACK replica: no hace falta hacer nada crítico (solo debug)
-            return
-        end
-        if typ == "X" then
-            local name = parts[2]
-            applyDeleteToDB(name)
-            return
+    if attrs.T == "REQSNAP" then
+        if GAT:IsMasterBuild() then
+            sendSnapshot(sender)
         end
         return
     end
 
-    if event == "PLAYER_ENTERING_WORLD" then
-        -- init prefix, peers, tickers
-        if S._initialized then return end
-        S._initialized = true
-
-        C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
-
-        -- Ensure DB & ids
-        local sd = ensureSyncDB()
-        S.clientId = sd.clientId
-        S.selfName = (UnitName("player") or "player") .. "-" .. ((GetRealmName() or "?"):gsub("%s+", ""))
-
-        -- master flag por build (solo el addon con master.lua puede ser Master)
-        -- (En followers, GAT.IS_MASTER_BUILD no existe y esto queda false)
-        S.isMasterAccount = (GAT.IS_MASTER_BUILD == true)
-
-        -- (Compat) guardamos en settings para debug, pero NO se usa para decidir roles
-        GAT.db.settings = GAT.db.settings or {}
-        GAT.db.settings.masterAccount = S.isMasterAccount
-
-        S.peers = S.peers or {}
-
-        -- Heartbeat ticker (todos)
-        C_Timer.NewTicker(HB_INTERVAL, function()
-            if not isGuildReady() then return end
-            local isMaster = S.isMasterAccount and "1" or "0"
-            local rev = (ensureSyncDB().rev or 0)
-            sendGuild(joinTabs("HB", S.clientId, tostring(VERSION), isMaster, tostring(rev)))
-        end)
-
-        -- Role maintenance
-        C_Timer.NewTicker(3, function()
-            if not isGuildReady() then return end
-            updateRole()
-            updateHelpersOnlineStatus()
-
-            -- si master apareció, intenta forward replica si el leader falta
-            forwardReplicaIfLeaderMissing()
-        end)
-
-        -- Leader flush ticker
-        C_Timer.NewTicker(FLUSH_INTERVAL, function()
-            if not isGuildReady() then return end
-            updateRole()
-            if S.role == "leader" and (not S.masterOnline) then
-                local delta = makeDeltaFromPending()
-                if delta then
-                    local sd2 = ensureSyncDB()
-                    local seq = sd2.outbox.nextSeq or 1
-                    enqueueOutbox(delta)
-                    -- replicate al backup (más robusto si el leader crashea)
-                    replicateToBackupIfNeeded(seq, delta)
-                end
-            end
-        
-            -- Master también emite deltas a GUILD para que los Ayudantes vean la misma data en vivo
-            if S.isMasterAccount and S.masterOnline then
-                local delta = makeDeltaFromPending()
-                if delta then
-                    broadcastDeltaToGuild(delta)
-                end
-            end
-
-end)
-
-        -- Sender ticker (cuando master online)
-        C_Timer.NewTicker(SEND_INTERVAL, function()
-            if not isGuildReady() then return end
-            updateRole()
-            trySendOneBatch()
-
-            -- Si se queda colgado, avisa 1 sola vez (sin spam)
-            if S._tx and S._tx.active and S._tx.started and (now() - S._tx.started) > 35 and not S._tx.warned then
-                S._tx.warned = true
-                syncPrint("tx_warn",
-                    color(C_RED, "Sync en progreso...") .. " tardando más de lo normal. " ..
-                    color(C_YELLOW, "Evita /reload") .. " y espera. (Si se cortó, el sistema reintenta.)")
-            end
-        end)
-
-        updateRole()
+    if attrs.T == "ACK" then
+        markAck(sender, tonumber(attrs.seq) or 0)
+        GAT:SysMsg("tx_state", "Backlog confirmado por GM.", COLOR_GREEN, false)
         return
     end
 
-    if event == "GUILD_ROSTER_UPDATE" then
-        -- Ayuda a auto-detect master si rank cambia con el tiempo
-        if not GAT.db or not GAT.db.settings then return end
-        if GAT.db.settings.masterAccount == false then
-            local _, rankName, rankIndex = GetGuildInfo("player")
-            if (IsGuildLeader and IsGuildLeader()) or rankIndex == 0 or (rankName == "Emperador") then
-                -- solo si el usuario quiere: no forzamos si ya está manualmente en false, lo dejamos.
-                -- (si quieres forzarlo, cambia esta condición)
-            end
+    if attrs.part then
+        handleFragment(sender, attrs)
+    end
+end
+
+-- =============================================================================
+-- Heartbeat y tickers
+-- =============================================================================
+local function sendHeartbeat()
+    if not isInGuildScope() then return end
+    local sd = ensureSyncDB()
+    local msg = string.format("T=HB|from=%s|master=%s|name=%s", sd.clientId, GAT:IsMasterBuild() and "1" or "0", GAT.fullPlayerName or "")
+    sendAddonMessage("GUILD", nil, msg)
+end
+
+local function updateHelpersMessage()
+    local sd = ensureSyncDB()
+    local nowt = now()
+    local helpers = {}
+    for cid, peer in pairs(sd.peers or {}) do
+        if not peer.isMaster and (nowt - (peer.lastSeen or 0) < MASTER_TIMEOUT) then
+            helpers[#helpers + 1] = peer.name or cid
         end
     end
-end)
+    table.sort(helpers)
+    local prev = sd._helpersCount or 0
+    local color = COLOR_WHITE
+    if #helpers > prev then color = COLOR_GREEN elseif #helpers < prev then color = COLOR_RED end
+    sd._helpersCount = #helpers
+    local msg = "Ayudantes online: " .. GAT:Color(color, tostring(#helpers))
+    if #helpers > 0 then
+        msg = msg .. " " .. GAT:Color(COLOR_WHITE, "(" .. table.concat(helpers, ", ") .. ")")
+    end
+    GAT:SysMsg("helpers_online", msg, nil, false)
+end
 
--- Public helper: for debug
-function GAT:GetSyncStatus()
-    return {
-        clientId = S.clientId,
-        role = S.role,
-        masterOnline = S.masterOnline,
-        masterName = S.masterName,
-        leaderId = S.leaderId,
-        backupId = S.backupId,
-        isMasterAccount = S.isMasterAccount,
-        rev = (GAT.db and GAT.db._sync and GAT.db._sync.rev) or 0
-    }
+function GAT:Sync_Init()
+    if R.initialized then return end
+    if not isInGuildScope() then return end
+    R.initialized = true
+    local sd = ensureSyncDB()
+    sd.sessionNonce = sd.sessionNonce or now()
+    resetSessionCache()
+
+    C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
+    computeRole()
+    self:SysMsg("session_start", "Sync listo. Estado inicial anunciado.", COLOR_BLUE, true)
+
+    local frame = CreateFrame("Frame")
+    frame:RegisterEvent("CHAT_MSG_ADDON")
+    frame:SetScript("OnEvent", function(_, event, ...)
+        if event == "CHAT_MSG_ADDON" then
+            onAddonMessage(...)
+        end
+    end)
+
+    C_Timer.NewTicker(HEARTBEAT_INTERVAL, function()
+        sendHeartbeat()
+    end)
+
+    C_Timer.NewTicker(ROLE_TICK_INTERVAL, function()
+        computeRole()
+        updateHelpersMessage()
+    end)
+
+    C_Timer.NewTicker(FLUSH_INTERVAL, function()
+        computeRole()
+        flushPending()
+    end)
+
+    C_Timer.NewTicker(SEND_INTERVAL, function()
+        computeRole()
+        sendOneBacklog()
+    end)
 end

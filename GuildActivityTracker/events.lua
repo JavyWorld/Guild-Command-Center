@@ -73,6 +73,7 @@ end
 -- Eventos
 -- =========================================================
 frame:SetScript("OnEvent", function(self, event, msg, sender)
+    if not GAT:IsInTargetGuild() then return end
     if event == "PLAYER_ENTERING_WORLD" then
         return
     end
@@ -98,7 +99,7 @@ frame:SetScript("OnEvent", function(self, event, msg, sender)
         -- data.lua se encargará de añadir el reino si falta.
         
         if GAT.IsSelf and GAT:IsSelf(sender) then return end
-        if GAT.IsInGuild and not GAT:IsInGuild() then return end
+        if not GAT:IsInTargetGuild() then return end
         if GAT.IsFiltered and GAT:IsFiltered(sender) then return end
 
         if GAT.AddActivity then GAT:AddActivity(sender, msg) end

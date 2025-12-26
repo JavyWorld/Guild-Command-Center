@@ -7,9 +7,9 @@
 
 core.lua
 data.lua
+sync.lua
 utils.lua
 events.lua
-sync.lua
 ui.lua
 master.lua
 activity.lua

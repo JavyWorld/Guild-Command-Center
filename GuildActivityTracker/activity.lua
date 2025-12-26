@@ -247,45 +247,16 @@ function GAT:RefreshUI()
             lastFS:SetJustifyH("LEFT")
             lastFS:SetText((data.lastSeen and data.lastSeen ~= "") and data.lastSeen or "—")
 
-            -- Botón Delete (solo MASTER)
-
-
-            if GAT and GAT.IS_MASTER_BUILD then
-
-
+            -- Botón Delete (solo MASTER y solo en vista de chats)
+            if GAT and GAT.IS_MASTER_BUILD and not (GAT.IsHelpersView and GAT:IsHelpersView()) then
                 local delete = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-
-
                 delete:SetSize(40, 18)
-
-
                 delete:SetPoint("RIGHT", -6, 0)
-
-
                 delete:SetText("Del")
-
-
                 delete:SetScript("OnClick", function()
-
-
-                    if GAT.ResetPlayer then
-
-
-                        GAT:ResetPlayer(data.name)
-
-
+                    if GAT.DeletePlayer then
+                        GAT:DeletePlayer(data.name)
                     end
-
-
-                    if GAT.RefreshUI then
-
-
-                        GAT:RefreshUI()
-
-
-                    end
-
-
                 end)
 
 

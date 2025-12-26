@@ -123,7 +123,7 @@ local function FindRankByShortName(shortName)
 end
 
 local function Announce(msg)
-    if not GAT.IsInGuild or not GAT:IsInGuild() then return end
+    if not GAT:IsInTargetGuild() then return end
     if type(msg) ~= "string" then return end
 
     local token = msg:match(ONLINE_PAT)
@@ -139,7 +139,7 @@ local function Announce(msg)
     if GuildRoster then pcall(GuildRoster) end
 
     C_Timer.After(0.20, function()
-        if not GAT.IsInGuild or not GAT:IsInGuild() then return end
+        if not GAT:IsInTargetGuild() then return end
         local rank = FindRankByShortName(shortName) or "—"
         local line = shortName .. " - " .. ColorRank(rank)
         ChatOut(line)

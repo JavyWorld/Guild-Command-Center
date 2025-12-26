@@ -87,10 +87,8 @@ function GAT:RefreshMissingList()
 
             delBtn:SetScript("OnClick", function()
 
-                if GAT.ResetPlayer then
-
-                    GAT:ResetPlayer(name)
-
+                if GAT.DeletePlayer then
+                    GAT:DeletePlayer(name)
                 end
 
                 -- No spamear: este print es útil, pero solo MASTER lo ve y es por acción manual.
@@ -156,7 +154,9 @@ function GAT:CreateMainWindow()
     syncBtn:SetPoint("LEFT", refreshBtn, "RIGHT", 5, 0)
     syncBtn:SetText("Sync")
     syncBtn:SetScript("OnClick", function()
-        if GAT.RequestRosterSync then GAT:RequestRosterSync() else if C_GuildInfo and C_GuildInfo.GuildRoster then C_GuildInfo.GuildRoster() elseif GuildRoster then pcall(GuildRoster) end print("|cff00ffff[GAT]|r Solicitando Roster...") end
+        if GAT.Sync_Manual then
+            GAT:Sync_Manual()
+        end
     end)
 
     local missingBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")

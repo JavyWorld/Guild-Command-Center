@@ -12,6 +12,8 @@ function GAT:InitStats()
 
     if not GAT.db.stats then GAT.db.stats = {} end
     
+    if not GAT:IsInTargetGuild() then return end
+
     GAT:ScheduleNextSnapshot()
     
     local f = CreateFrame("Frame")
@@ -47,7 +49,8 @@ function GAT:ScheduleNextSnapshot()
 end
 
 function GAT:TakeActivitySnapshot(force, immediate)
-    if not GAT.IsInGuild or not GAT:IsInGuild() then return end
+    if not GAT:IsInTargetGuild() then return end
+    if GAT.Sync_ShouldCollectStats and not GAT:Sync_ShouldCollectStats() then return end
 
     local now = time()
     if not force and (now - GAT.LastSnapshotTime < MIN_SNAPSHOT_DELAY) then return end
@@ -110,6 +113,9 @@ function GAT:TakeActivitySnapshot(force, immediate)
         local timestamp = time()
         if GAT.db.stats then
             GAT.db.stats[timestamp] = totalOnlineStats
+            if GAT.Sync_RecordDelta_Stats then
+                GAT:Sync_RecordDelta_Stats(timestamp, totalOnlineStats)
+            end
         end
         
         GAT.LastSnapshotTime = timestamp

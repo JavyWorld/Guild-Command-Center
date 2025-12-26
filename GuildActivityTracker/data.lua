@@ -1,126 +1,87 @@
 local addonName = ...
 local GAT = _G[addonName]
 
--- =========================================================
--- Helpers de Texto y Fecha
--- =========================================================
-
--- Obtiene el reino actual sin espacios (formato estándar de addons)
-local function GetMyRealm()
-    return (GetNormalizedRealmName and GetNormalizedRealmName()) or (GetRealmName and GetRealmName():gsub(" ", "")) or ""
-end
-
--- Convierte SIEMPRE el nombre a formato "Nombre-Reino"
-local function GetCanonicalName(name)
-    if not name or name == "" then return nil end
-    if name:find("-") then
-        return name -- Ya tiene reino
+-- =============================================================================
+-- Helpers de nombre/fecha
+-- =============================================================================
+local function getRealm()
+    if GetNormalizedRealmName then
+        return GetNormalizedRealmName() or ""
     end
-    -- Si no tiene reino, le pegamos el nuestro
-    return name .. "-" .. GetMyRealm()
+    return (GetRealmName() or ""):gsub(" ", "")
 end
 
-local function ConvertLastSeenToAmPm(s)
-    if type(s) ~= "string" or s == "" then return s end
-    if s:find(" AM", 1, true) or s:find(" PM", 1, true) then return s end
-
-    local y, m, d, hh, mm = s:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)%s+(%d%d):(%d%d)")
-    if not y then return s end
-
-    local H = tonumber(hh)
-    local M = tonumber(mm)
-    if not H or not M then return s end
-
-    local ampm = "AM"
-    local h12 = H
-    if H == 0 then h12 = 12; ampm = "AM"
-    elseif H == 12 then h12 = 12; ampm = "PM"
-    elseif H > 12 then h12 = H - 12; ampm = "PM"
-    else h12 = H; ampm = "AM" end
-
-    return string.format("%s-%s-%s %02d:%02d %s", y, m, d, h12, M, ampm)
+local function canonicalName(name)
+    if not name or name == "" then return nil end
+    if name:find("-") then return name end
+    return name .. "-" .. getRealm()
 end
 
-local function ParseLastSeenToTS(s)
-    if type(s) ~= "string" or s == "" then return 0 end
-    s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    local y, m, d, hh, mm, ap = s:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)%s+(%d%d?):(%d%d)%s*(AM|PM)$")
+local function parseLastSeen(tsOrStr)
+    if type(tsOrStr) == "number" then return tsOrStr end
+    if type(tsOrStr) ~= "string" then return 0 end
+    local y, m, d, hh, mm, ap = tsOrStr:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)%s+(%d%d):(%d%d)%s*(AM|PM)$")
     if y then
-        local H = tonumber(hh); if ap == "AM" and H == 12 then H = 0 end; if ap == "PM" and H ~= 12 then H = H + 12 end
+        local H = tonumber(hh)
+        if ap == "AM" and H == 12 then H = 0 end
+        if ap == "PM" and H ~= 12 then H = H + 12 end
         return time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = H, min = tonumber(mm), sec = 0 })
     end
-    local y2, m2, d2, HH, MM = s:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)%s+(%d%d):(%d%d)")
+    local y2, m2, d2, HH, MM = tsOrStr:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)%s+(%d%d):(%d%d)")
     if y2 then
         return time({ year = tonumber(y2), month = tonumber(m2), day = tonumber(d2), hour = tonumber(HH), min = tonumber(MM), sec = 0 })
     end
     return 0
 end
 
-local function DateKeyToTS(dateStr)
-    if not dateStr then return 0 end
-    local y, m, d = dateStr:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
-    if y then
-        return time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 0, min = 0, sec = 0 })
-    end
-    return 0
+local function lastSeenText(ts)
+    if not ts or ts == 0 then return "" end
+    return date("%Y-%m-%d %I:%M %p", ts)
 end
 
--- Helper interno para fusionar datos de 'source' en 'dest'
-local function MergeEntry(dest, source)
-    if not dest or not source then return end
-    
-    dest.total = (dest.total or 0) + (source.total or 0)
-    
-    dest.daily = dest.daily or {}
-    if source.daily then
-        for day, count in pairs(source.daily) do
-            dest.daily[day] = (dest.daily[day] or 0) + count
-        end
-    end
-    
-    -- Nos quedamos con la fecha más reciente
-    local destTS = dest.lastSeenTS or 0
-    local sourceTS = source.lastSeenTS or 0
-    if sourceTS > destTS then
-        dest.lastSeen = source.lastSeen
-        dest.lastSeenTS = source.lastSeenTS
-        dest.lastMessage = source.lastMessage
-    end
-    
-    -- Preservar rango
-    if (not dest.rankName or dest.rankName == "—") and (source.rankName and source.rankName ~= "—") then
-        dest.rankName = source.rankName
-        dest.rankIndex = source.rankIndex
-    end
+-- =============================================================================
+-- DB helpers
+-- =============================================================================
+function GAT:EnsureSyncDB()
+    self.db = self.db or _G.GuildActivityTrackerDB or {}
+    _G.GuildActivityTrackerDB = self.db
+    self.db._sync = self.db._sync or {}
+    local sd = self.db._sync
+
+    sd.clientId = sd.clientId or tostring(math.random(100000, 999999)) .. tostring(time())
+    sd.printCache = sd.printCache or {}
+    sd.sessionNonce = sd.sessionNonce or 0
+    sd.peers = sd.peers or {}
+    sd.lastAppliedSeqByPeer = sd.lastAppliedSeqByPeer or {}
+    sd.pendingSeq = sd.pendingSeq or 1
+    sd.pending = sd.pending or { activity = {}, stats = {} }
+    sd.outbox = sd.outbox or {}
+    sd.pendingBacklog = sd.pendingBacklog or {}
+    sd._sessionPrint = {}
+    return sd
 end
 
--- =========================================================
--- Gestión de DB
--- =========================================================
 function GAT:EnsureSortDefaults()
-    GAT.db = GAT.db or _G.GuildActivityTrackerDB or {}
-    _G.GuildActivityTrackerDB = GAT.db
-    GAT.db.settings = GAT.db.settings or {}
-
-    if GAT.db.settings.sortMode == nil then GAT.db.settings.sortMode = "count" end 
-    if GAT.db.settings.sortDir == nil then GAT.db.settings.sortDir = "desc" end   
-    
-    if GAT.db.settings.enableAutoArchive == nil then GAT.db.settings.enableAutoArchive = false end
-    if GAT.db.settings.autoArchiveDays == nil or GAT.db.settings.autoArchiveDays < 7 then 
-        GAT.db.settings.autoArchiveDays = 30 
+    self.db = self.db or _G.GuildActivityTrackerDB or {}
+    _G.GuildActivityTrackerDB = self.db
+    self.db.settings = self.db.settings or {}
+    if self.db.settings.sortMode == nil then self.db.settings.sortMode = "count" end
+    if self.db.settings.sortDir == nil then self.db.settings.sortDir = "desc" end
+    if self.db.settings.enableAutoArchive == nil then self.db.settings.enableAutoArchive = false end
+    if not self.db.settings.autoArchiveDays or self.db.settings.autoArchiveDays < 7 then
+        self.db.settings.autoArchiveDays = 30
     end
 end
 
 function GAT:UpgradeDBIfNeeded()
-    GAT.db = GAT.db or _G.GuildActivityTrackerDB or {}
-    _G.GuildActivityTrackerDB = GAT.db
-    GAT.db.data = GAT.db.data or {}
-    GAT:EnsureSortDefaults()
+    self.db = self.db or _G.GuildActivityTrackerDB or {}
+    _G.GuildActivityTrackerDB = self.db
+    self.db.data = self.db.data or {}
+    self:EnsureSortDefaults()
 
-    -- 1. Migración de estructura
-    for name, value in pairs(GAT.db.data) do
+    for name, value in pairs(self.db.data) do
         if type(value) == "number" then
-            GAT.db.data[name] = { total = value, lastSeen = "", lastSeenTS = 0, lastMessage = "", daily = {}, rankIndex = 99, rankName = "—" }
+            self.db.data[name] = { total = value, lastSeen = "", lastSeenTS = 0, lastMessage = "", daily = {}, rankIndex = 99, rankName = "—" }
         elseif type(value) == "table" then
             value.total = value.total or 0
             value.lastSeen = value.lastSeen or ""
@@ -128,191 +89,183 @@ function GAT:UpgradeDBIfNeeded()
             value.rankIndex = value.rankIndex or 99
             value.rankName = value.rankName or "—"
             if type(value.lastSeenTS) ~= "number" then
-                value.lastSeenTS = ParseLastSeenToTS(value.lastSeen or "")
+                value.lastSeenTS = parseLastSeen(value.lastSeen or "")
             end
-            value.lastSeen = ConvertLastSeenToAmPm(value.lastSeen)
+            value.lastSeen = lastSeenText(value.lastSeenTS or 0)
         end
-    end
-
-    -- 2. LIMPIEZA DE DUPLICADOS (La Gran Unificación)
-    -- Recorremos la DB buscando claves que NO tengan guion (nombres cortos)
-    -- y las fusionamos con su versión con guion (nombre-reino).
-    local myRealm = GetMyRealm()
-    local mergedCount = 0
-
-    for name, entry in pairs(GAT.db.data) do
-        -- Si el nombre NO tiene guion...
-        if not name:find("-") then
-            -- Construimos el nombre completo teórico
-            local fullName = name .. "-" .. myRealm
-            
-            -- Si ya existe la entrada completa, fusionamos ESTA (corta) dentro de la COMPLETA
-            if GAT.db.data[fullName] then
-                MergeEntry(GAT.db.data[fullName], entry)
-                GAT.db.data[name] = nil -- Borramos la corta
-                mergedCount = mergedCount + 1
-            else
-                -- Si NO existe la completa, simplemente RENOMBRAMOS esta corta a completa
-                GAT.db.data[fullName] = entry
-                GAT.db.data[name] = nil
-                -- No cuenta como merge, es un rename, pero limpia la lista
-            end
-        end
-    end
-    
-    if mergedCount > 0 and GAT.Print then
-        GAT:Print("Mantenimiento: Se fusionaron " .. mergedCount .. " entradas duplicadas.")
     end
 end
 
--- =========================================================
--- Lógica Principal
--- =========================================================
+-- =============================================================================
+-- Mutaciones principales
+-- =============================================================================
+local function mergeDaily(dest, src)
+    dest.daily = dest.daily or {}
+    if src.daily then
+        for day, cnt in pairs(src.daily) do
+            dest.daily[day] = (dest.daily[day] or 0) + (cnt or 0)
+        end
+    end
+end
 
+function GAT:MergeEntry(name, incoming, mode)
+    if not name or not incoming then return end
+    self.db = self.db or _G.GuildActivityTrackerDB or {}
+    self.db.data = self.db.data or {}
+
+    local entry = self.db.data[name]
+    if type(entry) ~= "table" then
+        local oldVal = type(entry) == "number" and entry or 0
+        entry = { total = oldVal, lastSeen = "", lastSeenTS = 0, lastMessage = "", daily = {}, rankIndex = 99, rankName = "—" }
+        self.db.data[name] = entry
+    end
+
+    if mode == "snapshot" then
+        entry.total = incoming.total or entry.total or 0
+        entry.rankIndex = incoming.rankIndex or entry.rankIndex
+        entry.rankName = incoming.rankName or entry.rankName
+        if incoming.lastSeenTS and (incoming.lastSeenTS > (entry.lastSeenTS or 0)) then
+            entry.lastSeenTS = incoming.lastSeenTS
+            entry.lastSeen = lastSeenText(incoming.lastSeenTS)
+        end
+        mergeDaily(entry, incoming)
+        return
+    end
+
+    -- delta mode
+    entry.total = (entry.total or 0) + (incoming.total or 0)
+    mergeDaily(entry, incoming)
+    if incoming.lastSeenTS and incoming.lastSeenTS > (entry.lastSeenTS or 0) then
+        entry.lastSeenTS = incoming.lastSeenTS
+        entry.lastSeen = lastSeenText(incoming.lastSeenTS)
+        entry.lastMessage = incoming.lastMessage or entry.lastMessage
+    end
+    if (not entry.rankName or entry.rankName == "—") and incoming.rankName then
+        entry.rankName = incoming.rankName
+        entry.rankIndex = incoming.rankIndex
+    end
+end
+
+function GAT:DeletePlayer(name)
+    if not self:IsMasterBuild() then return end
+    if self.db and self.db.data then
+        self.db.data[name] = nil
+    end
+    if self.Sync_BroadcastDelete then
+        self:Sync_BroadcastDelete(name)
+    end
+    if self.RefreshUI then self:RefreshUI() end
+end
+
+-- =============================================================================
+-- Roster helpers
+-- =============================================================================
 function GAT:ScanRosterForRanks()
-    if not GAT.IsInGuild or not GAT:IsInGuild() then return end
-    GAT.db = GAT.db or {}
-    GAT.db.data = GAT.db.data or {}
+    if not self:IsInTargetGuild() then return end
+    self.db = self.db or {}
+    self.db.data = self.db.data or {}
 
     local numMembers = GetNumGuildMembers()
     for i = 1, numMembers do
         local fullName, rankName, rankIndex = GetGuildRosterInfo(i)
-        
         if not rankName and rankIndex then
             rankName = GuildControlGetRankName(rankIndex + 1)
         end
         if not rankName or rankName == "" then rankName = "Miembro" end
-
         if fullName then
-            -- Normalizamos SIEMPRE a Nombre-Reino para buscar en DB
-            local normalizedName = GetCanonicalName(fullName)
-            
-            if normalizedName and GAT.db.data[normalizedName] then
-                GAT.db.data[normalizedName].rankName = rankName
-                GAT.db.data[normalizedName].rankIndex = rankIndex
+            local normalized = canonicalName(fullName)
+            if normalized and self.db.data[normalized] then
+                self.db.data[normalized].rankName = rankName
+                self.db.data[normalized].rankIndex = rankIndex
             end
         end
     end
 end
 
-function GAT:AddActivity(player, msg, lineId, guid)
-    -- Si hay Sync activo, decide si este cliente DEBE contar este chat (evita duplicaciones)
-    if GAT.ShouldCountChat and (not GAT:ShouldCountChat()) then
+-- =============================================================================
+-- Activity ingestion
+-- =============================================================================
+function GAT:AddActivity(player, msg)
+    if not self:IsInTargetGuild() then return end
+    if self.Sync_ShouldCollectChat and (not self:Sync_ShouldCollectChat()) then
         return
     end
 
-    if not player then return end
-    
-    GAT.db = GAT.db or _G.GuildActivityTrackerDB or {}
-    GAT.db.data = GAT.db.data or {}
+    self.db = self.db or _G.GuildActivityTrackerDB or {}
+    self.db.data = self.db.data or {}
 
-    -- NORMALIZACIÓN ESTRICTA: Siempre convertimos a Nombre-Reino
-    local fullPlayerName = GetCanonicalName(player)
-    
-    -- Por si acaso, revisamos si existe una entrada "corta" vieja y la absorbemos ahora mismo
-    local shortName = Ambiguate(player, "short")
-    if shortName ~= fullPlayerName and GAT.db.data[shortName] then
-        -- Si no existe la larga, la creamos con los datos de la corta
-        if not GAT.db.data[fullPlayerName] then
-            GAT.db.data[fullPlayerName] = GAT.db.data[shortName]
-        else
-            -- Si existen ambas, fusionamos
-            MergeEntry(GAT.db.data[fullPlayerName], GAT.db.data[shortName])
-        end
-        GAT.db.data[shortName] = nil
+    local fullPlayerName = canonicalName(player)
+    if not fullPlayerName then return end
+
+    local entry = self.db.data[fullPlayerName]
+    if type(entry) ~= "table" then
+        local oldVal = type(entry) == "number" and entry or 0
+        entry = { total = oldVal, lastSeen = "", lastSeenTS = 0, lastMessage = "", daily = {}, rankIndex = 99, rankName = "—" }
+        self.db.data[fullPlayerName] = entry
     end
 
-    -- A partir de aquí, solo trabajamos con la clave completa
-    if type(GAT.db.data[fullPlayerName]) ~= "table" then
-        local oldVal = (type(GAT.db.data[fullPlayerName]) == "number") and GAT.db.data[fullPlayerName] or 0
-        GAT.db.data[fullPlayerName] = { total = oldVal, lastSeen = "", lastSeenTS = 0, lastMessage = "", daily = {}, rankIndex = 99, rankName = "—" }
-    end
-
-    local entry = GAT.db.data[fullPlayerName]
     local today = date("%Y-%m-%d")
-
     entry.total = (entry.total or 0) + 1
-    entry.lastSeen = date("%Y-%m-%d %I:%M %p") 
-    entry.lastSeenTS = time() 
+    entry.lastSeenTS = time()
+    entry.lastSeen = date("%Y-%m-%d %I:%M %p")
     entry.lastMessage = msg or entry.lastMessage or ""
     entry.daily[today] = (entry.daily[today] or 0) + 1
 
-    -- Reporte al módulo Sync para agregación multi-cliente (solo cuando aplica)
-    if GAT.Sync_RecordChat then
-        GAT:Sync_RecordChat(fullPlayerName, msg, lineId, guid)
+    if self.Sync_RecordDelta_Activity then
+        self:Sync_RecordDelta_Activity(fullPlayerName, 1, entry.lastSeenTS, today)
     end
 end
 
+-- =============================================================================
+-- Queries
+-- =============================================================================
 function GAT:GetSortedActivity()
-    GAT:EnsureSortDefaults()
-
+    self:EnsureSortDefaults()
     local out = {}
-    for name, entry in pairs(GAT.db.data or {}) do
+    for name, entry in pairs(self.db.data or {}) do
         if type(entry) == "number" then
-            entry = { total = entry, lastSeen = "", lastSeenTS = 0, rankIndex = 99, rankName = "—" }
+            entry = { total = entry, lastSeen = "", lastSeenTS = 0, rankIndex = 99, rankName = "—", daily = {} }
         end
-
-        local ts = entry.lastSeenTS
-        if type(ts) ~= "number" then ts = ParseLastSeenToTS(entry.lastSeen or "") end
-
         table.insert(out, {
             name = name,
             count = entry.total or 0,
             lastSeen = entry.lastSeen or "",
-            lastSeenTS = ts or 0,
+            lastSeenTS = entry.lastSeenTS or parseLastSeen(entry.lastSeen or ""),
             rankIndex = entry.rankIndex or 99,
             rankName = entry.rankName or "—"
         })
     end
 
-    local mode = GAT.db.settings.sortMode or "count"
-    local dir  = GAT.db.settings.sortDir  or "desc"
+    local mode = self.db.settings.sortMode or "count"
+    local dir = self.db.settings.sortDir or "desc"
 
     local function nameKey(n) return string.lower(tostring(n or "")) end
-    
-    local function getOnlineVal(n)
+    local function onlineVal(n)
         if GAT.IsOnline and GAT:IsOnline(n) then return 1 else return 0 end
     end
 
     local function cmp(a, b)
         if mode == "online" then
-            local ao = getOnlineVal(a.name)
-            local bo = getOnlineVal(b.name)
-            if ao ~= bo then
-                if dir == "asc" then return ao < bo else return ao > bo end
-            end
+            local ao, bo = onlineVal(a.name), onlineVal(b.name)
+            if ao ~= bo then return dir == "asc" and ao < bo or ao > bo end
             if a.rankIndex ~= b.rankIndex then return a.rankIndex < b.rankIndex end
             return nameKey(a.name) < nameKey(b.name)
-
         elseif mode == "rank" then
             if a.rankIndex ~= b.rankIndex then
-                if dir == "asc" then return a.rankIndex > b.rankIndex
-                else return a.rankIndex < b.rankIndex end
+                return dir == "asc" and a.rankIndex > b.rankIndex or a.rankIndex < b.rankIndex
             end
-            local ao = getOnlineVal(a.name)
-            local bo = getOnlineVal(b.name)
+            local ao, bo = onlineVal(a.name), onlineVal(b.name)
             if ao ~= bo then return ao > bo end
             return nameKey(a.name) < nameKey(b.name)
-
         elseif mode == "recent" then
-            local av = a.lastSeenTS or 0
-            local bv = b.lastSeenTS or 0
-            if av ~= bv then
-                if dir == "asc" then return av < bv end 
-                return av > bv 
-            end
+            local av, bv = a.lastSeenTS or 0, b.lastSeenTS or 0
+            if av ~= bv then return dir == "asc" and av < bv or av > bv end
             if a.count ~= b.count then return a.count > b.count end
             return nameKey(a.name) < nameKey(b.name)
-
-        else 
-            local ac = a.count or 0
-            local bc = b.count or 0
-            if ac ~= bc then
-                if dir == "asc" then return ac < bc end
-                return ac > bc
-            end
-            local av = a.lastSeenTS or 0
-            local bv = b.lastSeenTS or 0
+        else
+            local ac, bc = a.count or 0, b.count or 0
+            if ac ~= bc then return dir == "asc" and ac < bc or ac > bc end
+            local av, bv = a.lastSeenTS or 0, b.lastSeenTS or 0
             if av ~= bv then return av > bv end
             return nameKey(a.name) < nameKey(b.name)
         end
@@ -323,43 +276,51 @@ function GAT:GetSortedActivity()
 end
 
 function GAT:GetPlayerData(name)
-    local d = (GAT.db.data or {})[name]
+    local d = (self.db.data or {})[name]
     if type(d) == "table" then return d end
     return nil
 end
 
+-- =============================================================================
+-- Resets
+-- =============================================================================
 function GAT:ResetData()
     if self.db and self.db.data then wipe(self.db.data) end
 end
 
 function GAT:ResetPlayer(name)
-    if not GAT.IS_MASTER_BUILD then return end
-    if GAT.db and GAT.db.data then GAT.db.data[name] = nil end
+    if not self:IsMasterBuild() then return end
+    if self.db and self.db.data then self.db.data[name] = nil end
 end
 
--- =========================================================
--- AUTO ARCHIVE (Rolling Window)
--- =========================================================
+-- =============================================================================
+-- Auto archive
+-- =============================================================================
+local function dateKeyToTS(dateStr)
+    local y, m, d = dateStr:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+    if y then
+        return time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 0, min = 0, sec = 0 })
+    end
+    return 0
+end
+
 function GAT:RunAutoArchive()
-    if not GAT.db or not GAT.db.settings or not GAT.db.settings.enableAutoArchive then
+    if not self.db or not self.db.settings or not self.db.settings.enableAutoArchive then
         return
     end
-
-    local days = math.max(7, GAT.db.settings.autoArchiveDays or 30)
+    local days = math.max(7, self.db.settings.autoArchiveDays or 30)
     local cutoff = time() - (days * 24 * 3600)
-    
-    local removedDays = 0
-    local recalcPlayers = 0
-    local deletedPlayers = 0
 
-    if GAT.db.data then
-        for name, entry in pairs(GAT.db.data) do
+    local removedDays, recalcPlayers, deletedPlayers = 0, 0, 0
+
+    if self.db.data then
+        for name, entry in pairs(self.db.data) do
             if entry.daily and type(entry.daily) == "table" then
                 local newTotal = 0
                 local changed = false
 
                 for dateStr, dailyCount in pairs(entry.daily) do
-                    local ts = DateKeyToTS(dateStr)
+                    local ts = dateKeyToTS(dateStr)
                     if ts > 0 and ts < cutoff then
                         entry.daily[dateStr] = nil
                         removedDays = removedDays + 1
@@ -370,7 +331,7 @@ function GAT:RunAutoArchive()
                 end
 
                 if newTotal == 0 then
-                    GAT.db.data[name] = nil
+                    self.db.data[name] = nil
                     deletedPlayers = deletedPlayers + 1
                 else
                     entry.total = newTotal
@@ -381,8 +342,6 @@ function GAT:RunAutoArchive()
     end
 
     if deletedPlayers > 0 or removedDays > 0 then
-        if GAT.Print then 
-            GAT:Print("Limpieza: Se borraron " .. deletedPlayers .. " jugadores inactivos y " .. removedDays .. " días antiguos.") 
-        end
+        self:Print("Limpieza: Se borraron " .. deletedPlayers .. " jugadores inactivos y " .. removedDays .. " días antiguos.")
     end
 end
