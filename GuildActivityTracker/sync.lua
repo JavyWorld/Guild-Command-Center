@@ -283,6 +283,7 @@ function GAT:Sync_RecordDelta_Stats(ts, onlineCount)
     if not isInGuildScope() then return end
     local sd = ensureSyncDB()
     sd.pending = sd.pending or { activity = {}, stats = {} }
+    sd.pending.stats = sd.pending.stats or {}
     sd.pending.stats[ts] = onlineCount
 end
 
