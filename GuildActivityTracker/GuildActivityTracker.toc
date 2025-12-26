@@ -9,7 +9,9 @@ core.lua
 data.lua
 utils.lua
 events.lua
+sync.lua
 ui.lua
+master.lua
 activity.lua
 filters_ui.lua
 manage.lua

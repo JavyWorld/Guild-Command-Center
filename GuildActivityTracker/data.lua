@@ -195,7 +195,12 @@ function GAT:ScanRosterForRanks()
     end
 end
 
-function GAT:AddActivity(player, msg)
+function GAT:AddActivity(player, msg, lineId, guid)
+    -- Si hay Sync activo, decide si este cliente DEBE contar este chat (evita duplicaciones)
+    if GAT.ShouldCountChat and (not GAT:ShouldCountChat()) then
+        return
+    end
+
     if not player then return end
     
     GAT.db = GAT.db or _G.GuildActivityTrackerDB or {}
@@ -231,6 +236,11 @@ function GAT:AddActivity(player, msg)
     entry.lastSeenTS = time() 
     entry.lastMessage = msg or entry.lastMessage or ""
     entry.daily[today] = (entry.daily[today] or 0) + 1
+
+    -- Reporte al módulo Sync para agregación multi-cliente (solo cuando aplica)
+    if GAT.Sync_RecordChat then
+        GAT:Sync_RecordChat(fullPlayerName, msg, lineId, guid)
+    end
 end
 
 function GAT:GetSortedActivity()
@@ -323,6 +333,7 @@ function GAT:ResetData()
 end
 
 function GAT:ResetPlayer(name)
+    if not GAT.IS_MASTER_BUILD then return end
     if GAT.db and GAT.db.data then GAT.db.data[name] = nil end
 end
 

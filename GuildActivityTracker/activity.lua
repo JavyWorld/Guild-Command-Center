@@ -247,16 +247,49 @@ function GAT:RefreshUI()
             lastFS:SetJustifyH("LEFT")
             lastFS:SetText((data.lastSeen and data.lastSeen ~= "") and data.lastSeen or "—")
 
-            -- Botón Delete
-            local delete = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-            delete:SetSize(40, 18)
-            delete:SetPoint("RIGHT", -6, 0)
-            delete:SetText("Del")
-            delete:SetScript("OnClick", function()
-                if GAT.ResetPlayer then GAT:ResetPlayer(data.name) end
-                if GAT.RefreshUI then GAT:RefreshUI() end
-            end)
+            -- Botón Delete (solo MASTER)
 
+
+            if GAT and GAT.IS_MASTER_BUILD then
+
+
+                local delete = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+
+
+                delete:SetSize(40, 18)
+
+
+                delete:SetPoint("RIGHT", -6, 0)
+
+
+                delete:SetText("Del")
+
+
+                delete:SetScript("OnClick", function()
+
+
+                    if GAT.ResetPlayer then
+
+
+                        GAT:ResetPlayer(data.name)
+
+
+                    end
+
+
+                    if GAT.RefreshUI then
+
+
+                        GAT:RefreshUI()
+
+
+                    end
+
+
+                end)
+
+
+            end
             table.insert(content.rows, row)
             y = y - 22
         end

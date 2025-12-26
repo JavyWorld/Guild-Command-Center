@@ -73,16 +73,41 @@ function GAT:RefreshMissingList()
         local txt = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         txt:SetPoint("LEFT", 5, 0)
         txt:SetText(name)
-        local delBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-        delBtn:SetSize(60, 18)
-        delBtn:SetPoint("RIGHT", -5, 0)
-        delBtn:SetText("Eliminar")
-        delBtn:SetScript("OnClick", function()
-            if GAT.ResetPlayer then GAT:ResetPlayer(name) end
-            print("|cff00ffff[GAT]|r Eliminado: " .. name)
-            GAT:RefreshMissingList()
-            if GAT.RefreshUI then GAT:RefreshUI() end
-        end)
+        -- Botón Eliminar (solo MASTER)
+
+        if GAT and GAT.IS_MASTER_BUILD then
+
+            local delBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+
+            delBtn:SetSize(60, 18)
+
+            delBtn:SetPoint("RIGHT", -5, 0)
+
+            delBtn:SetText("Eliminar")
+
+            delBtn:SetScript("OnClick", function()
+
+                if GAT.ResetPlayer then
+
+                    GAT:ResetPlayer(name)
+
+                end
+
+                -- No spamear: este print es útil, pero solo MASTER lo ve y es por acción manual.
+
+                print("|cff00ffff[GAT]|r Eliminado: " .. name)
+
+                GAT:RefreshMissingList()
+
+                if GAT.RefreshUI then
+
+                    GAT:RefreshUI()
+
+                end
+
+            end)
+
+        end
         table.insert(f.Content.rows, row)
         y = y - 22
     end
