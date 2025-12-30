@@ -76,6 +76,12 @@ frame:SetScript("OnEvent", function(_, event, arg1)
         initDB()
         updatePlayerNames()
         printGuildWarning()
+
+        -- Ejecuta limpieza de ventana deslizante antes de reportar conteos
+        if GAT.RunAutoArchive then
+            GAT:RunAutoArchive()
+        end
+
         local count = 0
         for _ in pairs(GuildActivityTrackerDB.data) do count = count + 1 end
         GAT:Print("Cargado. Jugadores registrados: " .. count)
