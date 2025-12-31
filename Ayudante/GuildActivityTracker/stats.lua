@@ -28,8 +28,13 @@ function GAT:InitStats()
             GAT:TakeActivitySnapshot(true, true)
         elseif event == "GUILD_ROSTER_UPDATE" then
             local now = time()
+            if GAT.SnapshotInProgress or GAT.GuildRosterUpdateTimer then return end
+
             if (now - GAT.LastSnapshotTime > MIN_SNAPSHOT_DELAY) then
-                C_Timer.After(2, function() GAT:TakeActivitySnapshot(false, false) end)
+                GAT.GuildRosterUpdateTimer = C_Timer.After(2, function()
+                    GAT.GuildRosterUpdateTimer = nil
+                    GAT:TakeActivitySnapshot(false, false)
+                end)
             end
         end
     end)
@@ -52,12 +57,16 @@ function GAT:TakeActivitySnapshot(force, immediate)
     if not GAT:IsInTargetGuild() then return end
     if GAT.Sync_ShouldCollectStats and not GAT:Sync_ShouldCollectStats() then return end
 
+    if GAT.SnapshotInProgress then return end
+
     local now = time()
     if not force and (now - GAT.LastSnapshotTime < MIN_SNAPSHOT_DELAY) then return end
 
+    GAT.SnapshotInProgress = true
+
     local function SaveData()
         -- Reiniciamos tablas temporales
-        GAT.db.mythic = {} 
+        GAT.db.mythic = {}
         GAT.db.roster = {} -- NUEVO: Tabla para el roster completo
         
         local numMembers = GetNumGuildMembers()
@@ -117,9 +126,10 @@ function GAT:TakeActivitySnapshot(force, immediate)
                 GAT:Sync_RecordDelta_Stats(timestamp, totalOnlineStats)
             end
         end
-        
+
         GAT.LastSnapshotTime = timestamp
         GAT:ScheduleNextSnapshot()
+        GAT.SnapshotInProgress = false
     end
 
     if immediate then
