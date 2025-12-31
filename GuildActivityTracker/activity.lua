@@ -38,7 +38,7 @@ end
 
 function GAT:CreateTable(parent)
     local topMargin = -65 
-    local helperPanelHeight = (GAT:IsMasterBuild() and HELPERS_PANEL_HEIGHT) or 0
+    local helperPanelHeight = HELPERS_PANEL_HEIGHT
 
     -- Buscador
     local searchLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -146,6 +146,10 @@ function GAT:CreateTable(parent)
     content:SetSize(620, 400)
     scroll:SetScrollChild(content)
     parent.Content = content
+    parent.Scroll = scroll
+    parent.ScrollTopOffset = headerY - 22
+    parent.ScrollBottomBase = 12
+    parent.ScrollHelperHeight = helperPanelHeight
 
     if helperPanelHeight > 0 then
         GAT:CreateHelpersPanel(parent, helperPanelHeight)
@@ -188,7 +192,7 @@ local function ensureHelperRow(panel, idx)
 
         panel.rows[idx] = row
     end
-    row:SetPoint("TOPLEFT", 0, -24 - ((idx - 1) * 18))
+    row:SetPoint("TOPLEFT", 0, (panel.RowStartY or -24) - ((idx - 1) * 18))
     return row
 end
 
@@ -207,22 +211,38 @@ function GAT:CreateHelpersPanel(parent, height)
     local title = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     title:SetPoint("TOPLEFT", 0, 0)
     title:SetText("Ayudantes (GM)")
+    panel.Title = title
+
+    panel.StatusFS = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    panel.StatusFS:SetPoint("TOPLEFT", 0, -18)
+    panel.StatusFS:SetWidth(620)
+    panel.StatusFS:SetJustifyH("LEFT")
+    panel.StatusFS:Hide()
+
+    panel.StatusDetailFS = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    panel.StatusDetailFS:SetPoint("TOPLEFT", 0, -34)
+    panel.StatusDetailFS:SetWidth(620)
+    panel.StatusDetailFS:SetJustifyH("LEFT")
+    panel.StatusDetailFS:Hide()
 
     local line = panel:CreateTexture(nil, "ARTWORK")
     line:SetColorTexture(0.5, 0.5, 0.5, 0.4)
     line:SetSize(620, 1)
-    line:SetPoint("TOPLEFT", 0, -18)
+    line:SetPoint("TOPLEFT", 0, -44)
+
+    panel.HeaderY = -60
+    panel.RowStartY = -64
 
     for _, h in ipairs(helperColumns) do
         local fs = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        fs:SetPoint("TOPLEFT", h.x, -20)
+        fs:SetPoint("TOPLEFT", h.x, panel.HeaderY)
         fs:SetWidth(h.width)
         fs:SetJustifyH("LEFT")
         fs:SetText(h.label)
     end
 
     panel.EmptyFS = panel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    panel.EmptyFS:SetPoint("TOPLEFT", helperColumns[1].x, -28)
+    panel.EmptyFS:SetPoint("TOPLEFT", helperColumns[1].x, panel.RowStartY)
     panel.EmptyFS:SetText("Sin ayudantes todavía.")
     panel.EmptyFS:Hide()
 
@@ -236,11 +256,48 @@ function GAT:RefreshHelpersUI()
     local panel = f.HelpersPanel
     if not panel then return end
 
-    if not GAT:IsMasterBuild() then
+    local summary = (GAT.Sync_GetHelperNetworkSummary and GAT:Sync_GetHelperNetworkSummary()) or {}
+    local masterOnline = summary.masterOnline == true
+    local showPanel = GAT:IsMasterBuild() or (summary and summary.masterOnline == false)
+
+    if f.Scroll and f.ScrollTopOffset and f.ScrollBottomBase then
+        f.Scroll:ClearAllPoints()
+        f.Scroll:SetPoint("TOPLEFT", 10, f.ScrollTopOffset)
+        local bottomOffset = f.ScrollBottomBase + ((showPanel and f.ScrollHelperHeight) or 0)
+        f.Scroll:SetPoint("BOTTOMRIGHT", -30, bottomOffset)
+    end
+
+    if not showPanel then
         panel:Hide()
         return
     end
     panel:Show()
+
+    if panel.Title then
+        panel.Title:SetText(masterOnline and "Ayudantes (GM)" or "Ayudantes (GM offline)")
+    end
+
+    if panel.StatusFS and panel.StatusDetailFS then
+        if not masterOnline then
+            local leaderName = summary.leaderName and GAT:DisplayName(summary.leaderName) or "—"
+            local followerText = summary.isFollower and " (eres seguidor)" or ""
+            panel.StatusFS:SetText("GM offline. Líder actual: " .. leaderName .. followerText)
+
+            local helperNames = {}
+            for _, n in ipairs(summary.activeHelpers or {}) do
+                helperNames[#helperNames + 1] = GAT:DisplayName(n)
+            end
+            local helperList = table.concat(helperNames, ", ")
+            if helperList == "" then helperList = "Sin ayudantes activos" else helperList = "Ayudantes activos: " .. helperList end
+            panel.StatusDetailFS:SetText(helperList)
+
+            panel.StatusFS:Show()
+            panel.StatusDetailFS:Show()
+        else
+            panel.StatusFS:Hide()
+            panel.StatusDetailFS:Hide()
+        end
+    end
 
     for _, row in ipairs(panel.rows or {}) do
         row:Hide()
@@ -254,9 +311,14 @@ function GAT:RefreshHelpersUI()
             local row = ensureHelperRow(panel, idx)
 
             local nameText = GAT:DisplayName(h.name)
-            row.Name:SetText(nameText)
+            local isLeader = (summary and summary.leaderId and summary.leaderId == h.clientId and not masterOnline)
+            row.Name:SetText(isLeader and ("★ " .. nameText) or nameText)
             if h.online then
-                row.Name:SetTextColor(0, 1, 0, 1)
+                if isLeader then
+                    row.Name:SetTextColor(1, 0.9, 0.2, 1)
+                else
+                    row.Name:SetTextColor(0, 1, 0, 1)
+                end
             else
                 row.Name:SetTextColor(0.7, 0.7, 0.7, 1)
             end

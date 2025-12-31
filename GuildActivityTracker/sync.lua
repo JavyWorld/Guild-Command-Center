@@ -522,6 +522,8 @@ local function markPeer(sender, payload)
             trySendBacklog()
         end
     end
+
+    emitHelperNetworkStatus("hb")
 end
 
 local function prunePeers()
@@ -540,6 +542,81 @@ local function prunePeers()
             sd.peers[cid] = nil -- Limpieza profunda
         end
     end
+end
+
+local function buildHelperNetworkSummary()
+    local sd = ensureSyncDB()
+    local t = now()
+
+    local helpers = {}
+    for cid, peer in pairs(sd.peers or {}) do
+        if not peer.isMaster and peer.lastSeen and (t - peer.lastSeen) <= MASTER_TIMEOUT and peer.online ~= false then
+            helpers[cid] = peer
+        end
+    end
+
+    if (not sd.masterOnline) and (not GAT:IsMasterBuild()) then
+        helpers[sd.clientId or "self"] = helpers[sd.clientId or "self"] or {
+            name = GAT.fullPlayerName or select(1, UnitFullName("player")) or "yo",
+            lastChar = GAT.fullPlayerName or select(1, UnitFullName("player")) or "yo",
+            sender = GAT.fullPlayerName or select(1, UnitFullName("player")) or "yo",
+        }
+    end
+
+    local helperList = {}
+    for cid, peer in pairs(helpers) do
+        helperList[#helperList + 1] = {
+            cid = cid,
+            label = peer.lastChar or peer.name or peer.sender or cid
+        }
+    end
+    table.sort(helperList, function(a, b) return tostring(a.cid) < tostring(b.cid) end)
+
+    local leaderId, leaderName
+    if sd.masterOnline then
+        local mp = getMasterPeer()
+        leaderId = sd.masterPeerId
+        leaderName = (mp and (mp.lastChar or mp.name or mp.sender)) or "GM"
+    else
+        leaderId = helperList[1] and helperList[1].cid or sd.clientId
+        leaderName = helperList[1] and helperList[1].label or (GAT.fullPlayerName or "yo")
+    end
+
+    local activeNames = {}
+    for _, info in ipairs(helperList) do
+        activeNames[#activeNames + 1] = info.label
+    end
+
+    local summary = {
+        masterOnline = sd.masterOnline == true,
+        helperCount = #helperList,
+        leaderId = leaderId,
+        leaderName = leaderName,
+        role = sd.role or "idle",
+        isFollower = (sd.role == "follower"),
+        activeHelpers = activeNames,
+    }
+    sd.helperNetworkSummary = summary
+    return summary
+end
+
+local function emitHelperNetworkStatus(tag)
+    local summary = buildHelperNetworkSummary()
+    if not summary then return end
+
+    local followerText = summary.isFollower and " (seguidor)" or ""
+    local activeList = table.concat(summary.activeHelpers or {}, ", ")
+    if activeList == "" then activeList = "ninguno" end
+
+    local msg = string.format(
+        "Sync estado [%s]: ayudantes=%d | Líder=%s%s | Activos: %s",
+        tostring(tag or "estado"),
+        tonumber(summary.helperCount or 0) or 0,
+        tostring(summary.leaderName or "—"),
+        followerText,
+        activeList
+    )
+    GAT:SysMsg("sync_topology_status", msg, true)
 end
 
 local function computeRole()
@@ -617,6 +694,8 @@ local function computeRole()
         resetSessionCache()
         GAT:SysMsg("sync_role_" .. tostring(newRole), "Sync: rol = " .. tostring(newRole) .. (sd.masterOnline and " (GM online)" or " (GM OFF)"), true)
     end
+
+    emitHelperNetworkStatus("rol")
 
     return newRole
 end
@@ -998,6 +1077,10 @@ function GAT:Sync_GetHelpersForUI()
         return tostring(a.name) < tostring(b.name)
     end)
     return out
+end
+
+function GAT:Sync_GetHelperNetworkSummary()
+    return buildHelperNetworkSummary()
 end
 
 local function backlogPendingCount()
