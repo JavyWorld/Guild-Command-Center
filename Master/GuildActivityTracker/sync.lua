@@ -530,13 +530,8 @@ local function computeRole()
         newRole = (candidates[1] == sd.clientId) and "collector" or "idle"
     end
 
-    if newRole ~= sd.role then
-        sd.role = newRole
-        resetSessionCache()
-        GAT:Print("Sync: rol = " .. tostring(newRole) .. (sd.masterOnline and " (GM online)" or " (GM OFF)"))
-    end
-
-    return newRole
+    table.sort(list, function(a, b) return (a.lastSeenTS or 0) > (b.lastSeenTS or 0) end)
+    return list
 end
 
 local function getMasterPeer()
@@ -598,13 +593,7 @@ local function handleComplete(msgType, payload, meta, sender)
         sd.lastSnapshotAppliedAt = now()
         GAT:SysMsg("sync_rx_snap", "Sync: snapshot aplicado ✔", true)
 
-        local master = getMasterPeer()
-        if master and master.sender then
-            local okMsg = string.format("T=SNAPOK|from=%s|ts=%d|rev=%s", tostring(sd.clientId), now(), tostring(sd.rev or 0))
-            queueOutbox("WHISPER", master.sender, okMsg)
-        end
-        return
-    end
+    return meta
 end
 
 local function onFragment(meta, sender)
@@ -676,41 +665,6 @@ local function flushPending()
 
     sd.pending.activity = {}
     sd.pending.stats = {}
-end
-
-local function trySendBacklog()
-    local sd = ensureSyncDB()
-    if GAT:IsMasterBuild() then return end
-    if not sd.masterOnline then return end
-    if not sd.backlog or not hasValues(sd.backlog) then return end
-
-    local master = getMasterPeer()
-    if not master or not master.sender then return end
-
-    if sd.backlogInFlight then
-        if (now() - (sd.backlogInFlightAt or 0)) > BACKLOG_RETRY_SEC then
-            local bseq = sd.backlogInFlight
-            local payload = sd.backlog[bseq]
-            if payload then
-                enqueuePayloadMessage("BACK", payload, "WHISPER", master.sender, { rev = sd.rev or 0, bseq = bseq })
-                sd.backlogInFlightAt = now()
-                GAT:SysMsg("sync_back_retry", "Sync: reintentando backlog (bseq " .. tostring(bseq) .. ")", true)
-            else
-                sd.backlogInFlight = nil
-            end
-        end
-        return
-    end
-
-    local minSeq = nil
-    for bseq in pairs(sd.backlog) do
-        if not minSeq or bseq < minSeq then minSeq = bseq end
-    end
-    if not minSeq then return end
-
-    sd.backlogInFlight = minSeq
-    sd.backlogInFlightAt = now()
-    enqueuePayloadMessage("BACK", sd.backlog[minSeq], "WHISPER", master.sender, { rev = sd.rev or 0, bseq = minSeq })
 end
 
 function GAT:Sync_SendSnapshotTo(target)
@@ -804,31 +758,6 @@ function GAT:Sync_Manual()
     end
 end
 
--- =============================================================================
--- Estado para UI
--- =============================================================================
-function GAT:Sync_GetHelpersForUI()
-    local sd = ensureSyncDB()
-    local t = now()
-    local out = {}
-    for cid, peer in pairs(sd.peers or {}) do
-        out[#out + 1] = {
-            clientId = cid,
-            name = peer.name or peer.sender or "?",
-            sender = peer.sender or peer.name or "?",
-            isMaster = peer.isMaster == true,
-            lastSeenAgo = peer.lastSeen and (t - peer.lastSeen) or 9999,
-            rev = peer.rev or 0,
-            lastSyncTS = peer.lastSyncTS or 0,
-        }
-    end
-    table.sort(out, function(a,b)
-        if a.isMaster ~= b.isMaster then return a.isMaster end
-        return tostring(a.name) < tostring(b.name)
-    end)
-    return out
-end
-
 function GAT:Sync_GetStatusLine()
     local sd = ensureSyncDB()
     local role = sd.role or "idle"
@@ -896,14 +825,8 @@ local function onAddonMessage(prefix, msg, channel, sender)
         return
     end
 
-    if t == "U" or t == "BACK" or t == "SNAP" then
-        onFragment(meta, sender)
-        return
-    end
-    end)
-    if not ok then
-        GAT:SysMsg("sync_err_msg", "Sync error (msg): " .. tostring(err), true)
-    end
+    sd._helpersCount = curCount
+    sd._onlineHelpers = curSet
 end
 
 -- =============================================================================
