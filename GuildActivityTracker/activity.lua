@@ -447,15 +447,14 @@ function GAT:DisplayName(fullName)
 end
 
 function GAT:BuildRosterStatusText()
-    local now = time()
     local upd = (GAT.GetRosterLastUpdateAt and GAT:GetRosterLastUpdateAt()) or 0
-    local sinceUpd = (upd > 0) and (now - upd) or 0
 
     local sync = (GAT.Sync_GetStatusLine and GAT:Sync_GetStatusLine()) or ""
+    local rosterText = string.format("Actualización de roster: %s", FormatSyncAgo(upd))
     if sync ~= "" then
-        return string.format("Roster update: %s | %s", FormatAgo(sinceUpd), sync)
+        return rosterText .. " | " .. sync
     end
-    return string.format("Roster update: %s", FormatAgo(sinceUpd))
+    return rosterText
 end
 
 function GAT:StartAutoRosterRefresh()

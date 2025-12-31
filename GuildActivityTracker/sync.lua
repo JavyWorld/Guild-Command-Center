@@ -1031,15 +1031,103 @@ local function computeSyncState()
     return "Synced"
 end
 
+local function shortAgo(sec)
+    if not sec or sec <= 0 then return "—" end
+    if sec < 60 then return tostring(sec) .. "s" end
+    if sec < 3600 then return tostring(math.floor(sec / 60)) .. "m" end
+    return tostring(math.floor(sec / 3600)) .. "h"
+end
+
+local function formatSyncAgo(ts)
+    if not ts or ts <= 0 then return "—" end
+    return "hace " .. shortAgo(math.max(0, now() - ts))
+end
+
+local function getSelfDisplayName()
+    if GAT.fullPlayerName and GAT.fullPlayerName ~= "" then
+        return GAT.fullPlayerName
+    end
+    if UnitFullName then
+        local n, r = UnitFullName("player")
+        if n and n ~= "" then
+            if r and r ~= "" then return n .. "-" .. r end
+            return n
+        end
+    end
+    if UnitName then
+        local n = UnitName("player")
+        if n and n ~= "" then return n end
+    end
+    return "Tú"
+end
+
+local function getHelperLeaderName()
+    local sd = ensureSyncDB()
+    local t = now()
+    local helperCandidates = {}
+    for cid, peer in pairs(sd.peers or {}) do
+        if peer and not peer.isMaster and peer.lastSeen and (t - peer.lastSeen) <= MASTER_TIMEOUT then
+            helperCandidates[#helperCandidates + 1] = cid
+        end
+    end
+    helperCandidates[#helperCandidates + 1] = sd.clientId
+    table.sort(helperCandidates)
+    local leaderId = helperCandidates[1]
+    if not leaderId then return nil end
+    if leaderId == sd.clientId then
+        return getSelfDisplayName()
+    end
+    local peer = (sd.peers or {})[leaderId]
+    return (peer and (peer.lastChar or peer.name or peer.sender)) or leaderId
+end
+
+local ROLE_LABELS = {
+    master = "GM (maestro)",
+    collector = "Ayudante recolector",
+    follower = "Ayudante en espera",
+    idle = "En espera",
+}
+
+local STATE_LABELS = {
+    ["In progress"] = "En progreso",
+    ["Need sync"] = "Necesita sincronización",
+    ["Synced"] = "Sincronizado",
+}
+
 function GAT:Sync_GetStatusLine()
     local sd = ensureSyncDB()
     local role = sd.role or "idle"
-    local mo = sd.masterOnline and "GM:ON" or "GM:OFF"
-    local q = outboxSize()
-    local rev = sd.rev or 0
-    local backlog = backlogPendingCount()
     local syncState = computeSyncState()
-    return string.format("Sync:%s %s rev:%d Q:%d | Estado:%s | Backlog:%d", role, mo, rev, q, syncState, backlog)
+    local rev = sd.rev or 0
+
+    local roleText = ROLE_LABELS[role] or tostring(role)
+
+    local gmOnline = sd.masterOnline or self:IsMasterBuild()
+    local gmPeer = getMasterPeer()
+    local gmName = (gmPeer and (gmPeer.lastChar or gmPeer.name or gmPeer.sender)) or "GM"
+    local gmText
+    if gmOnline then
+        gmText = self:IsMasterBuild() and "GM conectado (este personaje)" or ("GM conectado: " .. tostring(gmName))
+    else
+        local helperLeader = getHelperLeaderName()
+        gmText = "GM desconectado; líder ayudante: " .. tostring(helperLeader or "—")
+    end
+
+    local queueText = "Cola de envíos: " .. tostring(outboxSize())
+    local backlogText = "Backlog pendiente: " .. tostring(backlogPendingCount())
+    local lastSyncText = "Último sync: " .. formatSyncAgo(sd.lastSnapshotAppliedAt)
+    local stateText = "Estado de sync: " .. (STATE_LABELS[syncState] or tostring(syncState))
+    local revText = "Revisión de datos: " .. tostring(rev)
+
+    return table.concat({
+        "Rol: " .. roleText,
+        gmText,
+        stateText,
+        queueText,
+        backlogText,
+        lastSyncText,
+        revText
+    }, " | ")
 end
 
 -- =============================================================================
