@@ -65,10 +65,12 @@ function GAT:EnsureSyncDB()
     sd.backlogSeq = sd.backlogSeq or sd.pendingBacklogSeq or 0
     sd.pendingBacklogSeq = sd.backlogSeq
 
-    -- ACK / in-flight (compat: antes backlogInFlightKey)
+    -- Estado de backlog en vuelo (compat: antes backlogInFlightKey)
     sd.backlogInFlight = sd.backlogInFlight or nil
     sd.backlogInFlightAt = sd.backlogInFlightAt or 0
     sd.backlogInFlightKey = sd.backlogInFlightKey or nil
+    sd.backlogRetryAttempts = sd.backlogRetryAttempts or 0
+    sd.backlogNextRetryAt = sd.backlogNextRetryAt or 0
 
     -- Dejó de usarse pero lo preservamos para no romper SavedVariables viejas
     sd.lastAppliedSeqByPeer = sd.lastAppliedSeqByPeer or {}
