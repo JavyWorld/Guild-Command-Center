@@ -1,6 +1,21 @@
 local addonName = ...
 local GAT = _G[addonName]
 
+local HELPERS_PANEL_HEIGHT = 120
+
+local function FormatAgo(sec)
+    if not sec or sec <= 0 then return "—" end
+    if sec < 60 then return sec .. "s" end
+    if sec < 3600 then return math.floor(sec / 60) .. "m" end
+    return math.floor(sec / 3600) .. "h"
+end
+
+local function FormatSyncAgo(ts)
+    if not ts or ts <= 0 then return "—" end
+    local delta = math.max(0, time() - ts)
+    return "hace " .. FormatAgo(delta)
+end
+
 -- Helper para sorting
 function GAT:SortBy(newMode)
     GAT.db = GAT.db or {}
@@ -23,6 +38,7 @@ end
 
 function GAT:CreateTable(parent)
     local topMargin = -65 
+    local helperPanelHeight = (GAT:IsMasterBuild() and HELPERS_PANEL_HEIGHT) or 0
 
     -- Buscador
     local searchLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -124,12 +140,147 @@ function GAT:CreateTable(parent)
     -- =========================
     local scroll = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
     scroll:SetPoint("TOPLEFT", 10, headerY - 22)
-    scroll:SetPoint("BOTTOMRIGHT", -30, 12)
+    scroll:SetPoint("BOTTOMRIGHT", -30, 12 + helperPanelHeight)
 
     local content = CreateFrame("Frame")
     content:SetSize(620, 400)
     scroll:SetScrollChild(content)
     parent.Content = content
+
+    if helperPanelHeight > 0 then
+        GAT:CreateHelpersPanel(parent, helperPanelHeight)
+    end
+end
+
+local helperColumns = {
+    { key = "name", label = "Ayudante", x = 10, width = 150 },
+    { key = "char", label = "Personaje actual", x = 170, width = 170 },
+    { key = "role", label = "Rol", x = 350, width = 80 },
+    { key = "sync", label = "Último sync (hace X)", x = 440, width = 160 },
+}
+
+local function ensureHelperRow(panel, idx)
+    panel.rows = panel.rows or {}
+    local row = panel.rows[idx]
+    if not row then
+        row = CreateFrame("Frame", nil, panel)
+        row:SetSize(600, 16)
+
+        row.Name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.Name:SetPoint("LEFT", helperColumns[1].x, 0)
+        row.Name:SetWidth(helperColumns[1].width)
+        row.Name:SetJustifyH("LEFT")
+
+        row.Char = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.Char:SetPoint("LEFT", helperColumns[2].x, 0)
+        row.Char:SetWidth(helperColumns[2].width)
+        row.Char:SetJustifyH("LEFT")
+
+        row.Role = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.Role:SetPoint("LEFT", helperColumns[3].x, 0)
+        row.Role:SetWidth(helperColumns[3].width)
+        row.Role:SetJustifyH("LEFT")
+
+        row.Sync = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        row.Sync:SetPoint("LEFT", helperColumns[4].x, 0)
+        row.Sync:SetWidth(helperColumns[4].width)
+        row.Sync:SetJustifyH("LEFT")
+
+        panel.rows[idx] = row
+    end
+    row:SetPoint("TOPLEFT", 0, -24 - ((idx - 1) * 18))
+    return row
+end
+
+function GAT:CreateHelpersPanel(parent, height)
+    if parent.HelpersPanel then return end
+
+    local panel = CreateFrame("Frame", nil, parent)
+    panel:SetPoint("BOTTOMLEFT", 10, 10)
+    panel:SetPoint("BOTTOMRIGHT", -10, 10)
+    panel:SetHeight(height)
+
+    local bg = panel:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0, 0, 0, 0.15)
+
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    title:SetPoint("TOPLEFT", 0, 0)
+    title:SetText("Ayudantes (GM)")
+
+    local line = panel:CreateTexture(nil, "ARTWORK")
+    line:SetColorTexture(0.5, 0.5, 0.5, 0.4)
+    line:SetSize(620, 1)
+    line:SetPoint("TOPLEFT", 0, -18)
+
+    for _, h in ipairs(helperColumns) do
+        local fs = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        fs:SetPoint("TOPLEFT", h.x, -20)
+        fs:SetWidth(h.width)
+        fs:SetJustifyH("LEFT")
+        fs:SetText(h.label)
+    end
+
+    panel.EmptyFS = panel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    panel.EmptyFS:SetPoint("TOPLEFT", helperColumns[1].x, -28)
+    panel.EmptyFS:SetText("Sin ayudantes todavía.")
+    panel.EmptyFS:Hide()
+
+    panel.rows = {}
+    parent.HelpersPanel = panel
+end
+
+function GAT:RefreshHelpersUI()
+    local f = GAT.MainWindow
+    if not f or not f:IsShown() then return end
+    local panel = f.HelpersPanel
+    if not panel then return end
+
+    if not GAT:IsMasterBuild() then
+        panel:Hide()
+        return
+    end
+    panel:Show()
+
+    for _, row in ipairs(panel.rows or {}) do
+        row:Hide()
+    end
+
+    local helpers = (GAT.Sync_GetHelpersForUI and GAT:Sync_GetHelpersForUI()) or {}
+    local idx = 0
+    for _, h in ipairs(helpers) do
+        if not h.isMaster then
+            idx = idx + 1
+            local row = ensureHelperRow(panel, idx)
+
+            local nameText = GAT:DisplayName(h.name)
+            row.Name:SetText(nameText)
+            if h.online then
+                row.Name:SetTextColor(0, 1, 0, 1)
+            else
+                row.Name:SetTextColor(0.7, 0.7, 0.7, 1)
+            end
+
+            row.Char:SetText(GAT:DisplayName(h.lastChar))
+
+            local roleText = h.role or "—"
+            row.Role:SetText(roleText)
+
+            local syncText = FormatSyncAgo(h.lastSyncTS)
+            row.Sync:SetText(syncText)
+            row.Sync:SetTextColor(h.online and 1 or 0.8, h.online and 1 or 0.8, h.online and 1 or 0.8, 1)
+
+            row:Show()
+        end
+    end
+
+    if panel.EmptyFS then
+        if idx == 0 then
+            panel.EmptyFS:Show()
+        else
+            panel.EmptyFS:Hide()
+        end
+    end
 end
 
 function GAT:RefreshUI()
@@ -276,6 +427,9 @@ function GAT:RefreshUI()
     if f.RosterStatusFS and GAT.BuildRosterStatusText then
         f.RosterStatusFS:SetText(GAT:BuildRosterStatusText())
     end
+    if GAT.RefreshHelpersUI then
+        GAT:RefreshHelpersUI()
+    end
 end
 
 -- =========================================================
@@ -290,13 +444,6 @@ function GAT:DisplayName(fullName)
     if not fullName then return "" end
     if Ambiguate then return Ambiguate(fullName, "short") end
     return fullName:match("^[^-]+") or fullName
-end
-
-local function FormatAgo(sec)
-    if sec <= 0 then return "—" end
-    if sec < 60 then return sec .. "s" end
-    if sec < 3600 then return math.floor(sec / 60) .. "m" end
-    return math.floor(sec / 3600) .. "h"
 end
 
 function GAT:BuildRosterStatusText()
@@ -317,6 +464,9 @@ function GAT:StartAutoRosterRefresh()
         GAT._statusTicker = C_Timer.NewTicker(1, function()
             if GAT.MainWindow and GAT.MainWindow:IsShown() and GAT.MainWindow.RosterStatusFS then
                 GAT.MainWindow.RosterStatusFS:SetText(GAT:BuildRosterStatusText())
+            end
+            if GAT.MainWindow and GAT.MainWindow:IsShown() and GAT.RefreshHelpersUI then
+                GAT:RefreshHelpersUI()
             end
         end)
     end

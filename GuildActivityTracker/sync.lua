@@ -453,19 +453,21 @@ local function markPeer(sender, payload)
     peer.sender = sender or peer.sender
     local pname = payload.name
     if pname == "" then pname = nil end
+    if pname then peer.lastChar = pname end
     peer.name   = pname or peer.name or sender
     peer.isMaster = payload.master == "1"
     peer.rev = tonumber(payload.rev or peer.rev or 0) or 0
     peer.role = payload.role or peer.role
     peer.realm = payload.realm or peer.realm
 
-    local wasOnline = peer.online
+    local wasOnline = peer.online == true
     peer.lastSeen = nowTS
     peer.online = true
-    peer.lastOnline = peer.lastOnline or nowTS
+    peer.lastOnline = nowTS
     peer.lastOffline = peer.lastOffline or 0
-    if wasOnline == false then
-        GAT:SysMsg("sync_peer_on_" .. cid, "Sync: " .. (peer.name or cid) .. " online", true)
+    if not wasOnline then
+        local roleText = peer.role or payload.role or "?"
+        GAT:SysMsg("sync_peer_on_" .. cid, "Sync: " .. (peer.name or cid) .. " online (rol " .. tostring(roleText) .. ")", true)
     end
 
     if payload.master == "1" then
@@ -474,6 +476,11 @@ local function markPeer(sender, payload)
     end
 
     sd.peers[cid] = peer
+
+    if isNew and not peer.isMaster then
+        local roleText = peer.role or payload.role or "?"
+        GAT:SysMsg("sync_helper_join_" .. cid, "Ayudante " .. (peer.lastChar or peer.name or cid) .. " conectado, rol " .. tostring(roleText), true)
+    end
 
     -- Auto-snapshot: si soy Master build y aparece un helper nuevo, le empujo snapshot.
     if isNew and GAT:IsMasterBuild() then
@@ -490,6 +497,9 @@ local function markPeer(sender, payload)
 
     -- Marca al GM inmediatamente y fuerza reevaluar rol/backlog sin esperar el siguiente tick.
     if payload.master == "1" then
+        sd.masterPeerId = cid
+        sd.masterOnline = true
+        GAT:SysMsg("sync_master_seen_" .. cid, "Sync: GM detectado (" .. tostring(peer.lastChar or peer.name or cid) .. ")", true)
         if not GAT:IsMasterBuild() then
             computeRole()
             trySendBacklog()
@@ -505,7 +515,8 @@ local function prunePeers()
             if peer.online ~= false then
                 peer.online = false
                 peer.lastOffline = t
-                GAT:SysMsg("sync_peer_off_" .. cid, "Sync: " .. (peer.name or cid) .. " offline", true)
+                local lastChar = peer.lastChar or peer.name or cid
+                GAT:SysMsg("sync_peer_off_" .. cid, "Sync: " .. tostring(lastChar) .. " offline", true)
             end
         end
         if peer.lastSeen and (t - peer.lastSeen) > (MASTER_TIMEOUT * 3) then
@@ -537,7 +548,9 @@ local function computeRole()
     -- Presence transitions (informative)
     if sd._prevMasterOnline ~= nil and sd._prevMasterOnline ~= masterOnline then
         if masterOnline then
-            GAT:SysMsg("sync_gm_online", "Sync: GM detectado (ONLINE).", true)
+            local mp = getMasterPeer()
+            local who = mp and (mp.lastChar or mp.name or mp.sender) or "GM"
+            GAT:SysMsg("sync_gm_online", "Sync: GM detectado (ONLINE) — " .. tostring(who), true)
             if sd.backlog and hasValues(sd.backlog) then
                 GAT:SysMsg("sync_backlog_flush", "GM detectado. Pasando datos al GM...", true)
                 trySendBacklog()
@@ -585,7 +598,7 @@ local function computeRole()
     if newRole ~= sd.role then
         sd.role = newRole
         resetSessionCache()
-        GAT:Print("Sync: rol = " .. tostring(newRole) .. (sd.masterOnline and " (GM online)" or " (GM OFF)"))
+        GAT:SysMsg("sync_role_" .. tostring(newRole), "Sync: rol = " .. tostring(newRole) .. (sd.masterOnline and " (GM online)" or " (GM OFF)"), true)
     end
 
     return newRole
@@ -708,6 +721,12 @@ local function onFragment(meta, sender)
         inc[key] = nil
         handleComplete(meta.T, merged, meta, sender)
     else
+        if meta.T == "BACK" and bucket.got == 1 then
+            local from = meta.from or sender or "?"
+            local peer = (ensureSyncDB().peers or {})[from]
+            local label = peer and (peer.lastChar or peer.name or peer.sender) or from
+            GAT:SysMsg("sync_rx_back_begin_" .. tostring(from), "Recibiendo backlog de " .. tostring(label), true)
+        end
         if meta.T == "SNAP" and bucket.got == 1 then
             GAT:SysMsg("sync_rx_snap_begin", string.format("Sync: recibiendo snapshot (%d partes) ...", bucket.total), true)
         end
@@ -926,6 +945,7 @@ function GAT:Sync_GetHelpersForUI()
             isMaster = peer.isMaster == true,
             lastSeenAgo = peer.lastSeen and (t - peer.lastSeen) or 9999,
             rev = peer.rev or 0,
+            lastChar = peer.lastChar or peer.name or peer.sender or "?",
             lastSyncTS = peer.lastSyncTS or 0,
             online = peer.online ~= false,
             lastOnline = peer.lastOnline or 0,
